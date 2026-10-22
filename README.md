@@ -6,7 +6,7 @@ Small, inspectable tools for server operators. Each tool states what it reads, w
 
 `tools/php_security_scan.py` checks local evidence for [CVE-2026-109618](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w) and [CVE-2026-109619](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp). Normal scans are **read-only and offline**. The optional `--mitigate` mode can update supported Ubuntu PHP packages after two explicit approvals. Python 3.8+ and the standard library are enough.
 
-The default result is a short verdict, relevant evidence, and copyable commands without numbering or inline comments. `--verbose` adds coverage and supporting findings. `--json` is for automation and sharing detailed evidence after review.
+The default result is a short verdict, relevant evidence, and copyable commands without numbering or inline comments. `--verbose` adds coverage and supporting findings. `--json` is for automation and sharing detailed evidence after review. Terminal color is used only for headings and status on an interactive terminal; all conclusions remain readable without it.
 
 ### Run
 
@@ -40,30 +40,35 @@ sudo sh tools/php-security-check.sh --mitigate
 
 The tool scans first and checks that installed packages are below [Canonical's fixed revision](https://ubuntu.com/security/notices/USN-8948-1). It shows `apt-get update` and waits for you to type `REFRESH`. After refreshing metadata it rescans, requires a fixed candidate for every affected installed package, checks apt holds and service state, and runs an apt simulation. It shows the exact package upgrades and commands, then waits for `APPLY`. It runs a targeted PHP package upgrade with `--only-upgrade --no-remove`, verifies installed package revisions, restarts only a confirmed active PHP-FPM or Apache service, and rescans. Apt itself may ask further questions. If any check fails, the tool stops and explains what needs manual attention.
 
+The prompts work entirely from the keyboard. Enter alone, any other text, or Ctrl+C cancels; noninteractive sessions cannot approve changes. For plain terminal output, use `--no-color` or set `NO_COLOR`. Redirected output and JSON have no color codes. Commands printed for copying are never colored or prefixed with a shell prompt.
+
 The guarded package path covers Ubuntu 22.04/PHP 8.1, 24.04/PHP 8.3, 26.04/PHP 8.5, and 26.10/PHP 8.5, using the package lines published in Canonical's notice. `--mitigate` does not support cPanel/EasyApache, Windows, containers, or third-party PHP builds. Those scans continue to give guidance, but the tool will not guess a package manager or restart command. No package transaction can guarantee that every site serves the patched runtime; verify each web handler afterward. Package maintainer scripts can have side effects that an apt simulation cannot fully predict.
 
 ### Example result
 
 ```text
-PHP security check | read-only
-ACTION REQUIRED | CVE-2026-109618, CVE-2026-109619
+PHP SECURITY CHECK  /  read-only scan
+STATUS  ACTION REQUIRED
+CVEs    CVE-2026-109618, CVE-2026-109619
 
-Web PHP: php8.3-fpm 8.3.6-0ubuntu0.24.04.12 (below first fixed 8.3.6-0ubuntu0.24.04.13).
-Active local Nginx -> PHP-FPM socket route observed; web ports: 80, 443.
-Apt cache: candidate 8.3.6-0ubuntu0.24.04.12.
+FINDINGS
+  Web PHP: php8.3-fpm 8.3.6-0ubuntu0.24.04.12 (below first fixed
+    8.3.6-0ubuntu0.24.04.13).
+  Active local Nginx -> PHP-FPM socket route observed; web ports: 80, 443.
+  Apt cache: candidate 8.3.6-0ubuntu0.24.04.12.
 
-Next actions
-Guided fix (shows and asks before each change):
+NEXT ACTIONS
+Guided fix; commands are shown before approval:
   sudo sh tools/php-security-check.sh --mitigate
-To check apt yourself:
+Check apt yourself:
   sudo apt update
   apt-cache policy php8.3-fpm
 If the candidate remains below 8.3.6-0ubuntu0.24.04.13, check apt sources/security pocket.
 After patching, check the service and the served PHP runtime for each site.
 
-Evidence: https://ubuntu.com/security/notices/USN-8948-1
-Scope: local inventory only; no web request or exploit test. Historical compromise is unknown.
-Details: --verbose | Automation: --json
+Source  https://ubuntu.com/security/notices/USN-8948-1
+Limits  Local inventory only; no web request or exploit test. Past compromise is unknown.
+More    --verbose for evidence  |  --json for automation
 ```
 
 This is illustrative output, not a claim about your server. Each indented command can be copied as-is. The scanner still checks the package candidate and apt's proposed changes before installing. A PHP CLI version such as `8.3.6` can remain unchanged after Ubuntu backports a security fix; inspect the complete Ubuntu package revision.

@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 
@@ -570,7 +571,33 @@ def make_report():
             ]}
 
 
-def render_report(report, verbose=False):
+def terminal_color_enabled():
+    """Use decoration only on an interactive terminal that allows color."""
+    return (sys.stdout.isatty() and "NO_COLOR" not in os.environ
+            and os.environ.get("TERM", "") != "dumb")
+
+
+def style(value, code, color=False):
+    return "\033[{}m{}\033[0m".format(code, value) if color else value
+
+
+def wrap_report_lines(lines):
+    width = max(60, min(96, shutil.get_terminal_size((80, 24)).columns))
+    output = []
+    for line in lines:
+        command = line.startswith("  ") and line.strip().startswith((
+            "sudo ", "apt-cache ", "apt-get ", "python3 ", "systemctl ", "sh "))
+        if command or len(line) <= width:
+            output.append(line)
+        else:
+            indent = "  " if line.startswith("  ") else ""
+            output.append(textwrap.fill(line.strip(), width=width, initial_indent=indent,
+                                        subsequent_indent=indent + "  ",
+                                        break_long_words=False, break_on_hyphens=False))
+    return "\n".join(output)
+
+
+def render_report(report, verbose=False, color=False, guided=False):
     """Human-readable result; omit hostnames and raw inventory by default."""
     context = report["context"]
     ubuntu = context.get("ubuntu_security") or {}
@@ -578,7 +605,10 @@ def render_report(report, verbose=False):
     affected = report["assessment"] == "ubuntu_packages_below_published_fix"
     fixed = report["assessment"] == "observed_binaries_fixed_or_vendor_patched_web_mapping_unverified"
     heading = "ACTION REQUIRED" if affected else "OBSERVED VERSIONS FIXED" if fixed else "REVIEW REQUIRED"
-    lines = ["PHP security check | read-only", "{} | {}".format(heading, ", ".join(CVES)), ""]
+    status_color = "1;31" if affected else "1;32" if fixed else "1;33"
+    lines = [style("PHP SECURITY CHECK", "1;36", color) + "  /  read-only scan",
+             "STATUS  " + style(heading, status_color, color),
+             "CVEs    " + ", ".join(CVES), "", style("FINDINGS", "1;36", color)]
     if ubuntu.get("packages"):
         packages = ubuntu["packages"]
         web_packages = [(name, item) for name, item in packages.items()
@@ -587,35 +617,36 @@ def render_report(report, verbose=False):
         if selected:
             name, item = selected[0]
             label = "Web PHP" if web_packages and route.get("status") == "active_local_route" else "PHP package"
-            lines.append("{}: {} {} ({}).".format(label, name, item["installed"],
+            lines.append("  {}: {} {} ({}).".format(label, name, item["installed"],
                          "below first fixed {}".format(ubuntu["first_fixed_package"])
                          if item["status"] == "below_fix" else
                          "meets first fixed {}".format(ubuntu["first_fixed_package"])
                          if item["status"] == "fixed" else "fix status unknown"))
         if len({p["status"] for p in packages.values()}) > 1:
-            lines.append("Installed PHP {} packages have mixed fix status; inspect --verbose.".format(ubuntu["branch"]))
+            lines.append("  Installed PHP {} packages have mixed fix status; inspect --verbose.".format(ubuntu["branch"]))
     elif report["binaries"]:
         for item in report["binaries"][:3]:
-            lines.append("PHP {}: {}.".format(item.get("version") or "unknown", item["status"].replace("_", " ")))
+            lines.append("  PHP {}: {}.".format(item.get("version") or "unknown", item["status"].replace("_", " ")))
         if len(report["binaries"]) > 3:
-            lines.append("{} more binaries; inspect --verbose.".format(len(report["binaries"]) - 3))
+            lines.append("  {} more binaries; inspect --verbose.".format(len(report["binaries"]) - 3))
     else:
-        lines.append("No PHP binary found in common locations.")
+        lines.append("  No PHP binary found in common locations.")
     if route.get("status") == "active_local_route":
-        lines.append("Active local Nginx -> PHP-FPM socket route observed; web ports: {}.".format(
+        lines.append("  Active local Nginx -> PHP-FPM socket route observed; web ports: {}.".format(
             ", ".join(route["web_ports"]) if route["web_ports"] else "not observed"))
     elif route.get("status") == "configured_route":
-        lines.append("Nginx and FPM socket configuration match; active route not confirmed.")
+        lines.append("  Nginx and FPM socket configuration match; active route not confirmed.")
     elif report["web_evidence"].get("running_php_web_workers"):
-        lines.append("PHP web workers observed; exact request route not confirmed.")
+        lines.append("  PHP web workers observed; exact request route not confirmed.")
     if ubuntu:
         branch = ubuntu["branch"]
         candidate = context.get("apt_candidates", {}).get("php{}-fpm".format(branch)) or context.get("apt_candidates", {}).get("php{}-cli".format(branch))
-        lines.append("Apt cache: {}.".format("candidate " + candidate if candidate else "candidate unavailable"))
+        lines.append("  Apt cache: {}.".format("candidate " + candidate if candidate else "candidate unavailable"))
         holds = context.get("apt_holds", {}).get("php_packages", [])
         if holds:
-            lines.append("Apt holds: {}.".format(", ".join(holds)))
-    lines.extend(["", "Next actions"])
+            lines.append("  Apt holds: {}.".format(", ".join(holds)))
+    if not guided:
+        lines.extend(["", style("NEXT ACTIONS", "1;36", color)])
     if affected and ubuntu:
         branch = ubuntu["branch"]
         fpm_name = "php{}-fpm".format(branch)
@@ -623,24 +654,28 @@ def render_report(report, verbose=False):
         package_to_check = (fpm_name if fpm_name in ubuntu["packages"] else
                             apache_name if apache_name in ubuntu["packages"] else
                             "php{}-cli".format(branch))
-        lines.append("Guided fix (shows and asks before each change):")
-        lines.append("  sudo sh tools/php-security-check.sh --mitigate")
-        lines.append("To check apt yourself:")
-        lines.extend(["  sudo apt update", "  apt-cache policy " + package_to_check])
-        lines.append("If the candidate remains below {}, check apt sources/security pocket.".format(
-            ubuntu["first_fixed_package"]))
-        lines.append("After patching, check the service and the served PHP runtime for each site.")
+        if not guided:
+            lines.append("Guided fix; commands are shown before approval:")
+            lines.append("  sudo sh tools/php-security-check.sh --mitigate")
+            lines.append("Check apt yourself:")
+            lines.extend(["  sudo apt update", "  apt-cache policy " + package_to_check])
+            lines.append("If the candidate remains below {}, check apt sources/security pocket.".format(
+                ubuntu["first_fixed_package"]))
+            lines.append("After patching, check the service and the served PHP runtime for each site.")
     elif fixed:
-        lines.append("  Confirm affected web workers restarted after the package update.")
-        lines.append("  Verify the served PHP runtime for each site, including containers and other handlers.")
+        if not guided:
+            lines.append("  Confirm affected web workers restarted after the package update.")
+            lines.append("  Verify the served PHP runtime for each site, including containers and other handlers.")
     else:
-        lines.append("  Check the PHP/vendor advisories for both CVEs and update each affected web runtime.")
-        lines.append("  Trace each web handler to its PHP runtime; verify the patch and restart affected workers.")
-    lines.extend(["", "Evidence: " + (ubuntu.get("notice") or "https://www.php.net/"),
-                  "Scope: local inventory only; no web request or exploit test. Historical compromise is unknown.",
-                  "Details: --verbose | Automation: --json"])
+        if not guided:
+            lines.append("  Check the PHP/vendor advisories for both CVEs and update each affected web runtime.")
+            lines.append("  Trace each web handler to its PHP runtime; verify the patch and restart affected workers.")
+    lines.extend(["", "Source  " + (ubuntu.get("notice") or "https://www.php.net/"),
+                  "Limits  Local inventory only; no web request or exploit test. Past compromise is unknown."])
+    if not guided:
+        lines.append("More    --verbose for evidence  |  --json for automation")
     if verbose:
-        lines.extend(["", "Evidence and coverage", "Binaries:"])
+        lines.extend(["", style("EVIDENCE AND COVERAGE", "1;36", color), "Binaries:"])
         for item in report["binaries"]:
             lines.append("  {} | {} | {}".format(item.get("version") or "?", item["status"], item["path"]))
         if not report["binaries"]:
@@ -663,7 +698,7 @@ def render_report(report, verbose=False):
         for gap in report["verification_gaps"]:
             lines.append("  - " + gap)
         lines.append("Raw structured evidence is available with --json; review local paths before sharing.")
-    return "\n".join(lines)
+    return wrap_report_lines(lines)
 
 
 def mitigation_plan(report):
@@ -709,10 +744,10 @@ def mitigation_plan(report):
 
 def approve(label):
     if not sys.stdin.isatty():
-        print("Stopped: approval needs an interactive terminal.")
+        print("Stopped: approval requires an interactive terminal.")
         return False
     try:
-        return input("Type {} to continue: ".format(label)).strip() == label
+        return input("Type {} and press Enter (anything else cancels): ".format(label)).strip() == label
     except (EOFError, KeyboardInterrupt):
         print("\nCancelled.")
         return False
@@ -720,7 +755,7 @@ def approve(label):
 
 def execute(argv):
     """Run a displayed command directly; leave apt and service output visible."""
-    print("\n$ " + " ".join(argv), flush=True)
+    print("\nRunning:\n  " + " ".join(argv), flush=True)
     try:
         return subprocess.call(argv)
     except OSError as exc:
@@ -753,10 +788,10 @@ def simulation_safe(output, packages, fixed):
     return True, upgrades
 
 
-def mitigate(initial):
+def mitigate(initial, color=False):
     """Two approvals: refresh metadata, then apply a checked PHP-only transaction."""
-    print("Guided remediation | changes require two approvals\n")
-    print(render_report(initial))
+    print(style("GUIDED REMEDIATION", "1;36", color) + "  /  two approvals required\n")
+    print(render_report(initial, color=color, guided=True))
     plan, reason = mitigation_plan(initial)
     if reason:
         print("\nGuided remediation stopped: " + reason)
@@ -764,9 +799,11 @@ def mitigate(initial):
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
         print("\nGuided remediation needs root. Run: sudo python3 tools/php_security_scan.py --mitigate")
         return 2
-    print("\nPhase 1: refresh package metadata. Command to execute:")
+    print("\n" + style("STEP 1 OF 2  REFRESH PACKAGE LISTS", "1;36", color))
+    print("This updates apt metadata. It does not install packages.\nCommand:")
     print("  apt-get update")
     if not approve("REFRESH"):
+        print("Cancelled. No package lists were refreshed by this run.")
         return 2
     if execute(["apt-get", "update"]) != 0:
         print("Apt metadata refresh failed; nothing was installed.")
@@ -793,16 +830,18 @@ def mitigate(initial):
     if not safe:
         print("Apt simulation stopped remediation: {} Nothing was installed.".format(detail))
         return 2
-    print("\nPhase 2: proposed apt changes:")
+    print("\n" + style("STEP 2 OF 2  REVIEW AND APPLY", "1;36", color))
+    print("Apt simulation proposes:")
     for name, version in sorted(detail.items()):
         print("  {} -> {}".format(name, version))
-    print("Commands to execute after approval:")
+    print("Commands after approval:")
     print("  " + " ".join(command))
     for unit in plan["restart_units"]:
         print("  systemctl restart " + unit)
     print("  python3 tools/php_security_scan.py")
     print("Apt may also run package maintainer scripts; the simulation cannot show every side effect.")
     if not approve("APPLY"):
+        print("Cancelled. Apt metadata was refreshed; no packages were installed by this run.")
         return 2
     if execute(command) != 0:
         print("Apt did not complete. Inspect its output and package state; workers were not restarted.")
@@ -817,7 +856,7 @@ def mitigate(initial):
             print("Restart failed. Check the service and resolve it before considering the patch complete.")
             return 3
     final = make_report()
-    print("\nPost-change scan:\n" + render_report(final))
+    print("\n" + style("POST-CHANGE SCAN", "1;36", color) + "\n" + render_report(final, color=color, guided=True))
     if any((final["context"].get("ubuntu_security") or {}).get("packages", {}).get(name, {}).get("status") != "fixed"
            for name in plan["packages"]):
         return 3
@@ -825,7 +864,8 @@ def mitigate(initial):
                         if item["active"] == "active"} for unit in plan["restart_units"]):
         print("A restarted service is not active. Investigate before declaring success.")
         return 3
-    print("\nPackage and service checks passed. Verify served PHP for each site; exposure history remains unknown.")
+    print("\n" + style("PACKAGE AND SERVICE CHECKS PASSED", "1;32", color))
+    print("Verify served PHP for each site; exposure history remains unknown.")
     return 0
 
 
@@ -835,11 +875,13 @@ def main():
     output.add_argument("--verbose", action="store_true", help="Show supporting evidence and coverage")
     output.add_argument("--json", action="store_true", help="Print structured JSON for automation")
     output.add_argument("--mitigate", action="store_true", help="Guide an approved Ubuntu PHP package update")
+    parser.add_argument("--no-color", action="store_true", help="Disable terminal colors")
     args = parser.parse_args()
     report = make_report()
+    color = terminal_color_enabled() and not args.no_color
     if args.mitigate:
-        return mitigate(report)
-    print(json.dumps(report, indent=2) if args.json else render_report(report, args.verbose))
+        return mitigate(report, color)
+    print(json.dumps(report, indent=2) if args.json else render_report(report, args.verbose, color))
     return 0
 
 

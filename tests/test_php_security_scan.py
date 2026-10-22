@@ -181,6 +181,25 @@ class SecurityScanTests(unittest.TestCase):
                 self.assertEqual(scan.mitigate(report), 2)
             execute.assert_not_called()
 
+    def test_terminal_color_is_optional_and_commands_stay_plain(self):
+        report = {"platform": "Linux", "context": ubuntu_context("below_fix"),
+                  "assessment": "ubuntu_packages_below_published_fix", "binaries": [],
+                  "web_route": None, "web_evidence": {"running_php_web_workers": []},
+                  "cves": list(scan.CVES)}
+        plain = scan.render_report(report)
+        colored = scan.render_report(report, color=True)
+        guided = scan.render_report(report, guided=True)
+        self.assertNotIn("\033[", plain)
+        self.assertIn("\033[", colored)
+        self.assertIn("  sudo sh tools/php-security-check.sh --mitigate", colored)
+        self.assertNotIn("\033[", next(line for line in colored.splitlines() if "sudo sh" in line))
+        self.assertNotIn("NEXT ACTIONS", guided)
+
+    def test_no_color_environment_overrides_tty(self):
+        with patch.dict(scan.os.environ, {"NO_COLOR": ""}), \
+             patch.object(scan.sys.stdout, "isatty", return_value=True):
+            self.assertFalse(scan.terminal_color_enabled())
+
     def test_fixed_candidate_stays_on_published_source_line(self):
         fixed = scan.UBUNTU_FIXED[("24.04", "8.3")]
         with patch.object(scan, "apt_candidates", return_value={"php8.3-fpm": "8.3.6-0ubuntu0.24.04.14"}), \
