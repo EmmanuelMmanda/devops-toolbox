@@ -22,6 +22,8 @@ FIXED = {"8.2": (8, 2, 35), "8.3": (8, 3, 36), "8.4": (8, 4, 27), "8.5": (8, 5, 
 CVES = ("CVE-2026-109618", "CVE-2026-109619")
 VERSION_RE = re.compile(r"PHP\s+(\d+)\.(\d+)\.(\d+)", re.I)
 MAX_BINARIES = 100
+UBUNTU_FIXED = {("24.04", "8.3"): "8.3.6-0ubuntu0.24.04.13"}
+UBUNTU_NOTICE = "https://ubuntu.com/security/notices/USN-8948-1"
 
 
 def run(argv, timeout=6):
@@ -79,25 +81,52 @@ def candidates(system, context):
     return unique
 
 
-def inspect_binary(path):
+def inspect_binary(path, context):
     output = run([path, "-v"])
     match = VERSION_RE.search(output)
     if not match:
         return {"path": path, "version": None, "status": "unreadable"}
     version = ".".join(match.groups())
     status, fixed = version_status(version)
-    return {"path": path, "version": version, "status": status,
-            "first_fixed_upstream": fixed}
+    result = {"path": path, "version": version, "status": status,
+              "first_fixed_upstream": fixed}
+    vendor = context.get("ubuntu_security") or {}
+    if path == "/usr/bin/php8.3" and vendor.get("release") == "24.04":
+        cli = vendor.get("packages", {}).get("php8.3-cli")
+        if cli and cli["status"] != "unknown":
+            result["status"] = "fixed_vendor_backport" if cli["status"] == "fixed" else "below_vendor_fix"
+            result["vendor_package"] = "php8.3-cli"
+            result["vendor_package_version"] = cli["installed"]
+            result["first_fixed_vendor_package"] = vendor["first_fixed_package"]
+    return result
+
+
+def dpkg_ge(installed, fixed):
+    try:
+        result = subprocess.run(["dpkg", "--compare-versions", installed, "ge", fixed],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                timeout=3, check=False)
+        if result.returncode in (0, 1):
+            return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
 
 
 def linux_context():
     result = {"distribution": None, "php_packages": [], "php_processes": [],
-              "cpanel": {"detected": False, "configured_branches": []}}
+              "cpanel": {"detected": False, "configured_branches": []},
+              "ubuntu_security": None}
+    os_id = version_id = None
     try:
         data = Path("/etc/os-release").read_text(errors="replace")
         match = re.search(r'^PRETTY_NAME="?([^"\n]+)', data, re.M)
         if match:
             result["distribution"] = match.group(1)
+        os_match = re.search(r'^ID="?([^"\n]+)', data, re.M)
+        version_match = re.search(r'^VERSION_ID="?([^"\n]+)', data, re.M)
+        os_id = os_match.group(1) if os_match else None
+        version_id = version_match.group(1) if version_match else None
     except OSError:
         pass
     if shutil.which("dpkg-query"):
@@ -108,6 +137,18 @@ def linux_context():
         output = run(["rpm", "-qa", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\n"], timeout=12)
         result["php_packages"] = [line for line in output.splitlines()
                                   if re.match(r"(?:php|ea-php|alt-php)[\w.+-]*\t", line)][:200]
+    if os_id == "ubuntu" and version_id == "24.04" and shutil.which("dpkg"):
+        package_versions = dict(line.split("\t", 1) for line in result["php_packages"] if "\t" in line)
+        fixed = UBUNTU_FIXED[("24.04", "8.3")]
+        packages = {}
+        for name, installed in package_versions.items():
+            if (re.fullmatch(r"php8\.3(?:-[\w.+-]+)?|libapache2-mod-php8\.3", name)
+                    and installed.startswith("8.3.")):
+                ge = dpkg_ge(installed, fixed)
+                packages[name] = {"installed": installed,
+                                  "status": "unknown" if ge is None else "fixed" if ge else "below_fix"}
+        result["ubuntu_security"] = {"release": "24.04", "notice": UBUNTU_NOTICE,
+                                     "first_fixed_package": fixed, "packages": packages}
     for name in ("php-fpm", "php-cgi", "lsphp", "httpd", "apache2", "frankenphp", "litespeed"):
         output = run(["pgrep", "-x", name]) if shutil.which("pgrep") else ""
         if output.strip():
@@ -142,15 +183,21 @@ def windows_context():
 def make_report():
     system = platform.system()
     context = windows_context() if system == "Windows" else linux_context() if system == "Linux" else {}
-    binaries = [inspect_binary(p) for p in candidates(system, context)]
+    binaries = [inspect_binary(p, context) for p in candidates(system, context)]
     statuses = {b["status"] for b in binaries}
-    if "below_upstream_fix" in statuses or "unsupported_upstream_check_vendor" in statuses:
+    ubuntu = context.get("ubuntu_security") or {}
+    vendor_states = {p["status"] for p in ubuntu.get("packages", {}).values()}
+    if "below_fix" in vendor_states or "below_vendor_fix" in statuses:
+        assessment = "ubuntu_packages_below_published_fix"
+    elif "below_upstream_fix" in statuses or "unsupported_upstream_check_vendor" in statuses:
         assessment = "potentially_affected_check_vendor_backports"
-    elif binaries and statuses == {"fixed_upstream"}:
-        assessment = "observed_binaries_fixed_upstream_web_mapping_unverified"
+    elif binaries and statuses.issubset({"fixed_upstream", "fixed_vendor_backport"}) and "unknown" not in vendor_states:
+        assessment = "observed_binaries_fixed_or_vendor_patched_web_mapping_unverified"
     else:
         assessment = "insufficient_evidence"
     next_steps = []
+    if assessment == "ubuntu_packages_below_published_fix":
+        next_steps.append("Ubuntu USN-8948-1 fixes both CVEs in PHP 8.3 package 8.3.6-0ubuntu0.24.04.13. Update installed PHP packages to at least this revision.")
     if assessment == "potentially_affected_check_vendor_backports":
         next_steps.append("Check the vendor advisory for both CVEs. Update every web-serving PHP branch lacking a confirmed fix.")
     if not binaries:
@@ -160,7 +207,7 @@ def make_report():
     elif system == "Linux":
         next_steps.append("Confirm each site's actual web PHP version; CLI, FPM, Apache module, LiteSpeed, and containers can differ.")
     next_steps.extend([
-        "A package version below the upstream number may contain a vendor backport; package metadata alone cannot prove either CVE is fixed.",
+        "For packages without a matched official vendor notice, an upstream version comparison cannot confirm whether a backport is present.",
         "After a confirmed patch, restart every affected web worker and verify the version through each served site.",
         "If previously exposed, review logs and investigate signs of compromise; this scan cannot establish whether exploitation occurred."
     ])
@@ -170,7 +217,8 @@ def make_report():
             "assessment": assessment, "binaries": binaries, "context": context,
             "next_steps": next_steps, "limitations": [
                 "Read-only local inventory; no network access, file writes, remediation, or exploit test.",
-                "Cannot confirm vendor backports or discover every custom installation, container, or domain mapping.",
+                "Only Ubuntu 24.04 PHP 8.3 has a built-in vendor package advisory check; other vendor backports require manual verification.",
+                "Cannot discover every custom installation, container, or domain mapping.",
                 "A clean result is not proof that every web request uses patched PHP."
             ]}
 

@@ -30,6 +30,7 @@ No administrator rights are required. Running as an administrator/root can revea
 
 - `below_upstream_fix` means the observed binary's version precedes PHP's fixed upstream release. A vendor may have backported the fix; check its advisory for **both** CVEs.
 - `fixed_upstream` means the observed binary meets the upstream fixed version for its branch.
+- On Ubuntu 24.04, the scanner also checks installed PHP 8.3 packages against [USN-8948-1](https://ubuntu.com/security/notices/USN-8948-1): `8.3.6-0ubuntu0.24.04.13` is the first fixed Ubuntu package for both CVEs. `below_vendor_fix` means an installed package predates that revision; `fixed_vendor_backport` means it meets or exceeds it.
 - `unsupported_upstream_check_vendor` means PHP 8.1 or older. PHP has not published an upstream release for that branch; obtain a vendor-confirmed backport or upgrade.
 - `unreadable`, `unknown_branch`, and `insufficient_evidence` require manual follow-up.
 
@@ -37,7 +38,7 @@ The first fixed upstream releases are **8.2.35, 8.3.36, 8.4.27, and 8.5.12**. So
 
 ### Important limits
 
-CLI PHP can differ from the PHP serving a website. Check **each site's actual web PHP version**, including FPM pools, Apache modules, LiteSpeed, containers, and IIS handler mappings. A fixed binary on disk does not prove an old worker has restarted. The scanner cannot establish whether a vendor backport contains the fix, find every custom installation, or determine whether a server was compromised. A clean scan is an inventory result, **not a security certification**.
+CLI PHP can differ from the PHP serving a website. Check **each site's actual web PHP version**, including FPM pools, Apache modules, LiteSpeed, containers, and IIS handler mappings. A fixed binary on disk does not prove an old worker has restarted. The scanner only has a built-in vendor backport check for Ubuntu 24.04 PHP 8.3; it cannot find every custom installation or determine whether a server was compromised. A clean scan is an inventory result, **not a security certification**.
 
 After confirming the vendor's patch, restart affected web workers, verify the served version per site, and investigate signs of compromise if the server was exposed before patching.
 
