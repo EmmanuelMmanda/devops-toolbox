@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Read-only local inventory for the PHP October 2026 security release.
+"""PHP October 2026 security check with optional approved remediation.
 
-Standard-library only. Does not need administrator access, use a network, or
-write to disk. Findings describe observed evidence, not proof of safety.
+Normal scans are read-only and offline. --mitigate can refresh apt metadata,
+install supported Ubuntu fixes, and restart known services after approval.
+Findings describe observed evidence, not proof of safety. Standard-library only.
 """
 
 import argparse
@@ -22,7 +23,12 @@ FIXED = {"8.2": (8, 2, 35), "8.3": (8, 3, 36), "8.4": (8, 4, 27), "8.5": (8, 5, 
 CVES = ("CVE-2026-109618", "CVE-2026-109619")
 VERSION_RE = re.compile(r"PHP\s+(\d+)\.(\d+)\.(\d+)", re.I)
 MAX_BINARIES = 100
-UBUNTU_FIXED = {("24.04", "8.3"): "8.3.6-0ubuntu0.24.04.13"}
+UBUNTU_FIXED = {
+    ("22.04", "8.1"): "8.1.2-1ubuntu2.28",
+    ("24.04", "8.3"): "8.3.6-0ubuntu0.24.04.13",
+    ("26.04", "8.5"): "8.5.4-0ubuntu1.5",
+    ("26.10", "8.5"): "8.5.9-0ubuntu2.1",
+}
 UBUNTU_NOTICE = "https://ubuntu.com/security/notices/USN-8948-1"
 MAX_CONFIG_MATCHES = 120
 WEB_PROCESS_RE = re.compile(r"php|apache|httpd|nginx|litespeed|lsws|caddy|frankenphp", re.I)
@@ -45,10 +51,11 @@ def probe(argv, timeout=8):
         p = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            timeout=timeout, check=False)
         return {"ok": p.returncode == 0, "stdout": p.stdout[:200000],
+                "truncated": len(p.stdout) > 200000,
                 "error": (p.stderr[:300].strip() or "exit_code_{}".format(p.returncode))
                 if p.returncode else ""}
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return {"ok": False, "stdout": "", "error": type(exc).__name__}
+        return {"ok": False, "stdout": "", "truncated": False, "error": type(exc).__name__}
 
 
 def version_status(version):
@@ -106,11 +113,12 @@ def inspect_binary(path, context):
     result = {"path": path, "version": version, "status": status,
               "first_fixed_upstream": fixed}
     vendor = context.get("ubuntu_security") or {}
-    if path == "/usr/bin/php8.3" and vendor.get("release") == "24.04":
-        cli = vendor.get("packages", {}).get("php8.3-cli")
+    branch = vendor.get("branch")
+    if branch and path == "/usr/bin/php{}".format(branch):
+        cli = vendor.get("packages", {}).get("php{}-cli".format(branch))
         if cli and cli["status"] != "unknown":
             result["status"] = "fixed_vendor_backport" if cli["status"] == "fixed" else "below_vendor_fix"
-            result["vendor_package"] = "php8.3-cli"
+            result["vendor_package"] = "php{}-cli".format(branch)
             result["vendor_package_version"] = cli["installed"]
             result["first_fixed_vendor_package"] = vendor["first_fixed_package"]
     return result
@@ -353,20 +361,28 @@ def linux_context():
         output = run(["rpm", "-qa", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\n"], timeout=12)
         result["php_packages"] = [line for line in output.splitlines()
                                   if re.match(r"(?:php|ea-php|alt-php)[\w.+-]*\t", line)][:200]
-    if os_id == "ubuntu" and version_id == "24.04" and shutil.which("dpkg"):
+    ubuntu_branch = next((branch for release, branch in UBUNTU_FIXED
+                          if os_id == "ubuntu" and release == version_id), None)
+    if ubuntu_branch and shutil.which("dpkg"):
         package_versions = dict(line.split("\t", 1) for line in result["php_packages"] if "\t" in line)
-        fixed = UBUNTU_FIXED[("24.04", "8.3")]
+        fixed = UBUNTU_FIXED[(version_id, ubuntu_branch)]
         packages = {}
         for name, installed in package_versions.items():
-            if (re.fullmatch(r"php8\.3(?:-[\w.+-]+)?|libapache2-mod-php8\.3", name)
-                    and installed.startswith("8.3.")):
-                ge = dpkg_ge(installed, fixed)
+            if (re.fullmatch(r"php{}(?:-[\w.+-]+)?|libapache2-mod-php{}".format(
+                    re.escape(ubuntu_branch), re.escape(ubuntu_branch)), name)
+                    and installed.startswith(ubuntu_branch + ".")):
+                source_line = re.escape(fixed.rsplit(".", 1)[0]) + r"(?:\.\d+)?"
+                ge = dpkg_ge(installed, fixed) if re.fullmatch(source_line, installed) else None
                 packages[name] = {"installed": installed,
                                   "status": "unknown" if ge is None else "fixed" if ge else "below_fix"}
-        result["ubuntu_security"] = {"release": "24.04", "notice": UBUNTU_NOTICE,
+        result["ubuntu_security"] = {"release": version_id, "branch": ubuntu_branch,
+                                     "notice": UBUNTU_NOTICE,
                                      "first_fixed_package": fixed, "packages": packages}
-    result["apt_candidates"] = apt_candidates(["php8.3-cli", "php8.3-fpm", "php8.3-common",
-                                                 "libapache2-mod-php8.3"])
+    branch_for_apt = ubuntu_branch or "8.3"
+    result["apt_candidates"] = apt_candidates(["php{}-cli".format(branch_for_apt),
+                                                 "php{}-fpm".format(branch_for_apt),
+                                                 "php{}-common".format(branch_for_apt),
+                                                 "libapache2-mod-php{}".format(branch_for_apt)])
     result["apt_holds"] = apt_holds()
     result["services"] = service_inventory()
     result["process_inventory"] = process_inventory()
@@ -506,13 +522,14 @@ def make_report():
         ]
     next_steps = []
     if assessment == "ubuntu_packages_below_published_fix":
-        next_steps.append("Ubuntu USN-8948-1 fixes both CVEs in PHP 8.3 package 8.3.6-0ubuntu0.24.04.13. Update installed PHP packages to at least this revision.")
+        next_steps.append("Ubuntu USN-8948-1 fixes both CVEs in PHP {} package {}. Update installed PHP packages to at least this revision.".format(
+            ubuntu["branch"], ubuntu["first_fixed_package"]))
         held = context.get("apt_holds", {}).get("php_packages", [])
         if held:
             next_steps.append("PHP packages are held by apt: {}. Review these holds before updating.".format(", ".join(held)))
-        candidate = context.get("apt_candidates", {}).get("php8.3-fpm") or context.get("apt_candidates", {}).get("php8.3-cli")
+        candidate = context.get("apt_candidates", {}).get("php{}-fpm".format(ubuntu["branch"])) or context.get("apt_candidates", {}).get("php{}-cli".format(ubuntu["branch"]))
         if candidate:
-            ge = dpkg_ge(candidate, UBUNTU_FIXED[("24.04", "8.3")])
+            ge = dpkg_ge(candidate, ubuntu["first_fixed_package"])
             if ge is False:
                 next_steps.append("Local apt metadata does not yet offer the fixed package. Refresh apt metadata and check enabled Ubuntu security repositories.")
             elif ge is True:
@@ -546,7 +563,7 @@ def make_report():
             "next_steps": next_steps, "verification_gaps": verification_gaps,
             "limitations": [
                 "Read-only local inventory; no network access, file writes, remediation, or exploit test.",
-                "Only Ubuntu 24.04 PHP 8.3 has a built-in vendor package advisory check; other vendor backports require manual verification.",
+                "Built-in vendor package checks cover only the Ubuntu release/branch pairs listed in USN-8948-1; other vendor backports require manual verification.",
                 "Cannot discover every custom installation, container runtime, include path, or domain mapping.",
                 "Cannot prove absence of compromise or reach 100% certainty from local inventory alone.",
                 "A clean result is not proof that every web request uses patched PHP."
@@ -576,7 +593,7 @@ def render_report(report, verbose=False):
                          "meets first fixed {}".format(ubuntu["first_fixed_package"])
                          if item["status"] == "fixed" else "fix status unknown"))
         if len({p["status"] for p in packages.values()}) > 1:
-            lines.append("Installed PHP 8.3 packages have mixed fix status; inspect --verbose.")
+            lines.append("Installed PHP {} packages have mixed fix status; inspect --verbose.".format(ubuntu["branch"]))
     elif report["binaries"]:
         for item in report["binaries"][:3]:
             lines.append("PHP {}: {}.".format(item.get("version") or "unknown", item["status"].replace("_", " ")))
@@ -592,20 +609,27 @@ def render_report(report, verbose=False):
     elif report["web_evidence"].get("running_php_web_workers"):
         lines.append("PHP web workers observed; exact request route not confirmed.")
     if ubuntu:
-        candidate = context.get("apt_candidates", {}).get("php8.3-fpm") or context.get("apt_candidates", {}).get("php8.3-cli")
+        branch = ubuntu["branch"]
+        candidate = context.get("apt_candidates", {}).get("php{}-fpm".format(branch)) or context.get("apt_candidates", {}).get("php{}-cli".format(branch))
         lines.append("Apt cache: {}.".format("candidate " + candidate if candidate else "candidate unavailable"))
         holds = context.get("apt_holds", {}).get("php_packages", [])
         if holds:
             lines.append("Apt holds: {}.".format(", ".join(holds)))
     lines.extend(["", "Next actions"])
     if affected and ubuntu:
-        lines.extend(["  1. sudo apt update", "  2. apt-cache policy php8.3-fpm"])
-        lines.append("  If the candidate is {} or newer:".format(ubuntu["first_fixed_package"]))
-        lines.extend(["  3. sudo apt upgrade    # review proposed changes before accepting",
-                      "  4. sudo systemctl restart php8.3-fpm",
-                      "  5. python3 tools/php_security_scan.py"])
-        lines.append("  If still older: check apt sources/security pocket; do not assume an upgrade will fix it.")
-        lines.append("  Then check service status and the served PHP runtime for each site.")
+        branch = ubuntu["branch"]
+        fpm_name = "php{}-fpm".format(branch)
+        apache_name = "libapache2-mod-php{}".format(branch)
+        package_to_check = (fpm_name if fpm_name in ubuntu["packages"] else
+                            apache_name if apache_name in ubuntu["packages"] else
+                            "php{}-cli".format(branch))
+        lines.append("Guided fix (shows and asks before each change):")
+        lines.append("  sudo sh tools/php-security-check.sh --mitigate")
+        lines.append("To check apt yourself:")
+        lines.extend(["  sudo apt update", "  apt-cache policy " + package_to_check])
+        lines.append("If the candidate remains below {}, check apt sources/security pocket.".format(
+            ubuntu["first_fixed_package"]))
+        lines.append("After patching, check the service and the served PHP runtime for each site.")
     elif fixed:
         lines.append("  Confirm affected web workers restarted after the package update.")
         lines.append("  Verify the served PHP runtime for each site, including containers and other handlers.")
@@ -642,13 +666,179 @@ def render_report(report, verbose=False):
     return "\n".join(lines)
 
 
+def mitigation_plan(report):
+    """Return a narrow Ubuntu package transaction or a reason to stop."""
+    if report["platform"] != "Linux":
+        return None, "Guided remediation currently supports listed Ubuntu PHP packages only."
+    ubuntu = report["context"].get("ubuntu_security") or {}
+    release, branch = ubuntu.get("release"), ubuntu.get("branch")
+    if (release, branch) not in UBUNTU_FIXED or not ubuntu.get("packages"):
+        return None, "No supported Ubuntu PHP package set was found."
+    packages = ubuntu["packages"]
+    if any(item["status"] == "unknown" for item in packages.values()):
+        return None, "Installed package status could not be verified."
+    if not any(item["status"] == "below_fix" for item in packages.values()):
+        return None, "The supported installed packages already meet the published fix."
+    if report["context"].get("apt_holds", {}).get("status") != "checked":
+        return None, "Apt holds could not be checked."
+    if report["context"]["apt_holds"].get("php_packages"):
+        return None, "PHP package holds need manual review."
+    if not all(shutil.which(cmd) for cmd in ("apt-get", "apt-cache", "dpkg", "systemctl")):
+        return None, "Required apt, dpkg, or systemctl command is unavailable."
+    services = report["context"].get("services", {})
+    if services.get("status") != "checked":
+        return None, "Service state could not be checked; worker restart is uncertain."
+    active = {item["unit"] for item in services.get("units", []) if item["active"] == "active"}
+    restart = []
+    fpm_name = "php{}-fpm".format(branch)
+    fpm_unit = fpm_name + ".service"
+    if fpm_unit in active and fpm_name in packages:
+        restart.append(fpm_unit)
+    if "apache2.service" in active and "libapache2-mod-php{}".format(branch) in packages:
+        restart.append("apache2.service")
+    workers = report["web_evidence"].get("running_php_web_workers", [])
+    if workers and not restart:
+        return None, "A PHP web worker is running but its restart service is not confirmed."
+    if report["web_evidence"].get("apache_php_module_observed") and "apache2.service" not in restart:
+        return None, "An Apache PHP module is active but its restart service is not confirmed."
+    return {"packages": sorted(name for name, item in packages.items() if item["status"] == "below_fix"),
+            "restart_units": restart,
+            "first_fixed": ubuntu["first_fixed_package"], "release": release,
+            "branch": branch}, None
+
+
+def approve(label):
+    if not sys.stdin.isatty():
+        print("Stopped: approval needs an interactive terminal.")
+        return False
+    try:
+        return input("Type {} to continue: ".format(label)).strip() == label
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled.")
+        return False
+
+
+def execute(argv):
+    """Run a displayed command directly; leave apt and service output visible."""
+    print("\n$ " + " ".join(argv), flush=True)
+    try:
+        return subprocess.call(argv)
+    except OSError as exc:
+        print("Failed to start {}: {}".format(argv[0], exc))
+        return 1
+
+
+def fixed_candidate(package, fixed):
+    candidate = apt_candidates([package]).get(package)
+    # Keep automatic installs on the exact source package revision line from the notice.
+    if not candidate or not re.fullmatch(re.escape(fixed.rsplit(".", 1)[0]) + r"\.\d+", candidate):
+        return None
+    return candidate if dpkg_ge(candidate, fixed) is True else None
+
+
+def simulation_safe(output, packages, fixed):
+    """Require every vulnerable target to be upgraded to a fixed revision."""
+    if re.search(r"^Remv\s", output, re.M):
+        return False, "Apt proposes a removal."
+    upgrades = {}
+    for line in output.splitlines():
+        match = re.match(r"^Inst\s+(\S+)\s+.*?\((\S+)", line)
+        if match:
+            upgrades[match.group(1)] = match.group(2)
+    for name, installed in packages.items():
+        if installed["status"] == "below_fix":
+            version = upgrades.get(name)
+            if not version or dpkg_ge(version, fixed) is not True:
+                return False, "Apt does not plan a fixed upgrade for {}.".format(name)
+    return True, upgrades
+
+
+def mitigate(initial):
+    """Two approvals: refresh metadata, then apply a checked PHP-only transaction."""
+    print("Guided remediation | changes require two approvals\n")
+    print(render_report(initial))
+    plan, reason = mitigation_plan(initial)
+    if reason:
+        print("\nGuided remediation stopped: " + reason)
+        return 2
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        print("\nGuided remediation needs root. Run: sudo python3 tools/php_security_scan.py --mitigate")
+        return 2
+    print("\nPhase 1: refresh package metadata. Command to execute:")
+    print("  apt-get update")
+    if not approve("REFRESH"):
+        return 2
+    if execute(["apt-get", "update"]) != 0:
+        print("Apt metadata refresh failed; nothing was installed.")
+        return 3
+    current = make_report()
+    plan, reason = mitigation_plan(current)
+    if reason:
+        print("Guided remediation stopped after refresh: " + reason)
+        return 2
+    candidates_by_name = {name: fixed_candidate(name, plan["first_fixed"])
+                          for name in plan["packages"]}
+    missing = [name for name, version in candidates_by_name.items() if not version]
+    if missing:
+        print("No confirmed fixed apt candidate for: {}. Nothing was installed.".format(", ".join(missing)))
+        return 2
+    package_specs = ["{}={}".format(name, candidates_by_name[name]) for name in plan["packages"]]
+    command = ["apt-get", "--no-remove", "--only-upgrade", "install"] + package_specs
+    simulation = probe(["apt-get", "--simulate"] + command[1:], timeout=45)
+    if not simulation["ok"] or simulation["truncated"]:
+        print("Apt simulation could not be fully checked: {}. Nothing was installed.".format(
+            "output too large" if simulation["truncated"] else simulation["error"]))
+        return 3
+    safe, detail = simulation_safe(simulation["stdout"], current["context"]["ubuntu_security"]["packages"], plan["first_fixed"])
+    if not safe:
+        print("Apt simulation stopped remediation: {} Nothing was installed.".format(detail))
+        return 2
+    print("\nPhase 2: proposed apt changes:")
+    for name, version in sorted(detail.items()):
+        print("  {} -> {}".format(name, version))
+    print("Commands to execute after approval:")
+    print("  " + " ".join(command))
+    for unit in plan["restart_units"]:
+        print("  systemctl restart " + unit)
+    print("  python3 tools/php_security_scan.py")
+    print("Apt may also run package maintainer scripts; the simulation cannot show every side effect.")
+    if not approve("APPLY"):
+        return 2
+    if execute(command) != 0:
+        print("Apt did not complete. Inspect its output and package state; workers were not restarted.")
+        return 3
+    after_install = make_report()
+    installed = (after_install["context"].get("ubuntu_security") or {}).get("packages", {})
+    if any(installed.get(name, {}).get("status") != "fixed" for name in plan["packages"]):
+        print("Package verification failed. Workers were not restarted; inspect installed versions.")
+        return 3
+    for unit in plan["restart_units"]:
+        if execute(["systemctl", "restart", unit]) != 0:
+            print("Restart failed. Check the service and resolve it before considering the patch complete.")
+            return 3
+    final = make_report()
+    print("\nPost-change scan:\n" + render_report(final))
+    if any((final["context"].get("ubuntu_security") or {}).get("packages", {}).get(name, {}).get("status") != "fixed"
+           for name in plan["packages"]):
+        return 3
+    if any(unit not in {item["unit"] for item in final["context"].get("services", {}).get("units", [])
+                        if item["active"] == "active"} for unit in plan["restart_units"]):
+        print("A restarted service is not active. Investigate before declaring success.")
+        return 3
+    print("\nPackage and service checks passed. Verify served PHP for each site; exposure history remains unknown.")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     output = parser.add_mutually_exclusive_group()
     output.add_argument("--verbose", action="store_true", help="Show supporting evidence and coverage")
     output.add_argument("--json", action="store_true", help="Print structured JSON for automation")
+    output.add_argument("--mitigate", action="store_true", help="Guide an approved Ubuntu PHP package update")
     args = parser.parse_args()
     report = make_report()
+    if args.mitigate:
+        return mitigate(report)
     print(json.dumps(report, indent=2) if args.json else render_report(report, args.verbose))
     return 0
 
