@@ -155,6 +155,39 @@ class SecurityScanTests(unittest.TestCase):
             context["apt_holds"]["php_packages"] = ["php8.3-fpm"]
             self.assertIn("holds", scan.mitigation_plan(report)[1])
 
+    def test_cpanel_uses_vendor_guidance_and_blocks_ubuntu_fix(self):
+        context = ubuntu_context("below_fix")
+        context["cpanel"] = {"detected": True, "configured_branches": ["8.3"]}
+        report = {"platform": "Linux", "context": context,
+                  "assessment": "ubuntu_packages_below_published_fix", "binaries": [],
+                  "web_route": None, "web_evidence": {"running_php_web_workers": []},
+                  "cves": list(scan.CVES)}
+        rendered = scan.render_report(report)
+        self.assertIn("EasyApache 4 release 25.91", rendered)
+        self.assertIn("MultiPHP Manager", rendered)
+        self.assertNotIn("sudo sh tools/php-security-check.sh --mitigate", rendered)
+        self.assertIn("cPanel/EasyApache", scan.mitigation_plan(report)[1])
+
+    def test_windows_report_points_to_iis_handlers(self):
+        report = {"platform": "Windows", "context": {"iis_fastcgi_paths": []},
+                  "assessment": "potentially_affected_check_vendor_backports",
+                  "binaries": [{"version": "8.3.35", "status": "below_upstream_fix", "path": r"C:\PHP\php.exe"}],
+                  "web_route": None, "web_evidence": {"running_php_web_workers": []},
+                  "cves": list(scan.CVES)}
+        rendered = scan.render_report(report)
+        self.assertIn("IIS FastCGI", rendered)
+        self.assertNotIn("sudo apt", rendered)
+
+    def test_windows_inventory_correlates_iis_handler_and_fastcgi(self):
+        fastcgi = '<application fullPath="C:\\PHP\\php-cgi.exe" />'
+        handlers = '<add scriptProcessor="C:\\PHP\\php-cgi.exe|-d test=1" />'
+        with patch.object(scan.shutil, "which", return_value=None), \
+             patch.object(scan.Path, "is_file", return_value=True), \
+             patch.object(scan, "run", side_effect=[fastcgi, handlers]):
+            context = scan.windows_context()
+        self.assertEqual(context["iis_fastcgi_paths"], [r"C:\PHP\php-cgi.exe"])
+        self.assertEqual(context["iis_handler_paths"], [r"C:\PHP\php-cgi.exe"])
+
     def test_simulation_rejects_removal_and_missing_fixed_upgrade(self):
         packages = {"php8.3-fpm": {"status": "below_fix"}}
         fixed = scan.UBUNTU_FIXED[("24.04", "8.3")]

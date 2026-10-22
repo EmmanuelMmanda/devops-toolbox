@@ -31,6 +31,7 @@ UBUNTU_FIXED = {
     ("26.10", "8.5"): "8.5.9-0ubuntu2.1",
 }
 UBUNTU_NOTICE = "https://ubuntu.com/security/notices/USN-8948-1"
+CPANEL_NOTICE = "https://docs.cpanel.net/changelogs/easyapache-4-change-log-25/"
 MAX_CONFIG_MATCHES = 120
 WEB_PROCESS_RE = re.compile(r"php|apache|httpd|nginx|litespeed|lsws|caddy|frankenphp", re.I)
 PHP_PACKAGE_RE = re.compile(r"(?:php|libapache2-mod-php|ea-php|alt-php)[\w.+-]*$")
@@ -80,6 +81,7 @@ def candidates(system, context):
             found.append(line.strip())
         found.extend(context["php_processes"])
         found.extend(context["iis_fastcgi_paths"])
+        found.extend(context.get("iis_handler_paths", []))
         patterns = [r"C:\PHP*\php.exe", r"C:\Program Files\PHP*\php.exe",
                     r"C:\xampp\php\php.exe", r"C:\laragon\bin\php\*\php.exe"]
     else:
@@ -407,7 +409,7 @@ def linux_context():
 
 
 def windows_context():
-    result = {"php_processes": [], "iis_fastcgi_paths": []}
+    result = {"php_processes": [], "iis_fastcgi_paths": [], "iis_handler_paths": []}
     ps = shutil.which("powershell.exe") or shutil.which("pwsh.exe")
     if ps:
         command = "Get-CimInstance Win32_Process -Filter \"Name='php-cgi.exe' OR Name='php.exe'\" | Select-Object -ExpandProperty ExecutablePath"
@@ -418,6 +420,9 @@ def windows_context():
         output = run([str(appcmd), "list", "config", "/section:system.webServer/fastCgi"])
         result["iis_fastcgi_paths"] = sorted(set(re.findall(
             r'fullPath="([^"]*php-cgi\.exe)"', output, re.I)))
+        handlers = run([str(appcmd), "list", "config", "/section:system.webServer/handlers"])
+        result["iis_handler_paths"] = sorted(set(re.findall(
+            r'scriptProcessor="([^"]*?php-cgi\.exe)(?:\|[^"]*)?"', handlers, re.I)))
     return result
 
 
@@ -485,7 +490,7 @@ def make_report():
         "web_handler_matches": (sum(1 for group in ("nginx", "apache") for m in
                                    config.get(group, {}).get("matches", [])
                                    if re.search(r"fastcgi_pass|SetHandler|ProxyPassMatch|AddHandler|LoadModule", m["setting"], re.I))
-                                   if system == "Linux" else len(context.get("iis_fastcgi_paths", []))),
+                                   if system == "Linux" else len(context.get("iis_handler_paths", []))),
         "running_containers": running_containers,
         "web_tcp_listeners": len(context.get("listeners", {}).get("tcp_web", [])),
         "php_unix_listeners": len(context.get("listeners", {}).get("php_unix", [])),
@@ -515,6 +520,9 @@ def make_report():
         coverage = [
             {"check": "common_php_binaries", "status": "checked"},
             {"check": "iis_fastcgi_paths", "status": "checked" if Path(
+                os.environ.get("WINDIR", r"C:\Windows"), "System32", "inetsrv", "appcmd.exe").is_file()
+                else "unavailable"},
+            {"check": "iis_php_handler_paths", "status": "checked" if Path(
                 os.environ.get("WINDIR", r"C:\Windows"), "System32", "inetsrv", "appcmd.exe").is_file()
                 else "unavailable"},
             {"check": "running_php_processes", "status": "checked" if shutil.which("powershell.exe") or shutil.which("pwsh.exe") else "unavailable"},
@@ -553,8 +561,8 @@ def make_report():
             verification_gaps.append("Container names were listed, but installed PHP inside containers was not inspected.")
         if not web_evidence["web_handler_matches"]:
             verification_gaps.append("No PHP web handler was found in the common Nginx/Apache config locations.")
-    elif system == "Windows" and not context.get("iis_fastcgi_paths"):
-        verification_gaps.append("No IIS FastCGI PHP path was observed; custom or bundled PHP installations may exist.")
+    elif system == "Windows" and not context.get("iis_handler_paths"):
+        verification_gaps.append("No global IIS PHP handler was observed; per-site handlers or bundled PHP installations may exist.")
     return {"tool": "php-security-scan", "scan_time_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "platform": system, "cves": list(CVES), "fixed_upstream": {
                 branch: ".".join(map(str, version)) for branch, version in FIXED.items()},
@@ -601,6 +609,7 @@ def render_report(report, verbose=False, color=False, guided=False):
     """Human-readable result; omit hostnames and raw inventory by default."""
     context = report["context"]
     ubuntu = context.get("ubuntu_security") or {}
+    cpanel = context.get("cpanel") or {}
     route = report.get("web_route") or {}
     affected = report["assessment"] == "ubuntu_packages_below_published_fix"
     fixed = report["assessment"] == "observed_binaries_fixed_or_vendor_patched_web_mapping_unverified"
@@ -645,9 +654,29 @@ def render_report(report, verbose=False, color=False, guided=False):
         holds = context.get("apt_holds", {}).get("php_packages", [])
         if holds:
             lines.append("  Apt holds: {}.".format(", ".join(holds)))
+    if cpanel.get("detected"):
+        branches = cpanel.get("configured_branches", [])
+        lines.append("  cPanel/EasyApache 4 detected{}.".format(
+            "; configured branches: " + ", ".join(branches) if branches else ""))
+        lines.append("  EasyApache 4 release 25.91 documents fixes for both CVEs; confirm each installed EA-PHP package.")
+    if report["platform"] == "Windows":
+        handlers = context.get("iis_handler_paths", [])
+        fastcgi = context.get("iis_fastcgi_paths", [])
+        lines.append("  IIS PHP handlers observed: {}; FastCGI registrations: {}.".format(
+            len(handlers), len(fastcgi)))
+        if handlers and not set(handlers).issubset(set(fastcgi)):
+            lines.append("  Some IIS PHP handlers do not match an observed FastCGI registration; inspect IIS configuration.")
     if not guided:
         lines.extend(["", style("NEXT ACTIONS", "1;36", color)])
-    if affected and ubuntu:
+    if cpanel.get("detected"):
+        if not guided:
+            lines.append("  In WHM: EasyApache 4 > Run System Update; review the changes.")
+            lines.append("  In WHM: MultiPHP Manager; check the PHP branch for every site.")
+            lines.append("  Compare installed EA-PHP packages with the EasyApache 4 25.91 change log.")
+            if ubuntu and any(p["status"] == "below_fix" for p in ubuntu.get("packages", {}).values()):
+                lines.append("  Separate Ubuntu PHP packages also need their own vendor update.")
+            lines.append("  Restart affected PHP workers, rescan, and verify served PHP per site.")
+    elif affected and ubuntu:
         branch = ubuntu["branch"]
         fpm_name = "php{}-fpm".format(branch)
         apache_name = "libapache2-mod-php{}".format(branch)
@@ -666,12 +695,20 @@ def render_report(report, verbose=False, color=False, guided=False):
         if not guided:
             lines.append("  Confirm affected web workers restarted after the package update.")
             lines.append("  Verify the served PHP runtime for each site, including containers and other handlers.")
+    elif report["platform"] == "Windows":
+        if not guided:
+            lines.append("  Check IIS FastCGI and PHP handler paths, or your bundled server's PHP path.")
+            lines.append("  Install a vendor-confirmed fixed PHP build; recycle affected workers and rescan.")
+            lines.append("  Verify the PHP runtime served by each site.")
     else:
         if not guided:
             lines.append("  Check the PHP/vendor advisories for both CVEs and update each affected web runtime.")
             lines.append("  Trace each web handler to its PHP runtime; verify the patch and restart affected workers.")
-    lines.extend(["", "Source  " + (ubuntu.get("notice") or "https://www.php.net/"),
-                  "Limits  Local inventory only; no web request or exploit test. Past compromise is unknown."])
+    source = CPANEL_NOTICE if cpanel.get("detected") else ubuntu.get("notice") or "https://www.php.net/"
+    lines.extend(["", "Source  " + source])
+    if cpanel.get("detected") and ubuntu and any(p["status"] == "below_fix" for p in ubuntu.get("packages", {}).values()):
+        lines.append("Source  " + ubuntu["notice"])
+    lines.append("Limits  Local inventory only; no web request or exploit test. Past compromise is unknown.")
     if not guided:
         lines.append("More    --verbose for evidence  |  --json for automation")
     if verbose:
@@ -705,6 +742,8 @@ def mitigation_plan(report):
     """Return a narrow Ubuntu package transaction or a reason to stop."""
     if report["platform"] != "Linux":
         return None, "Guided remediation currently supports listed Ubuntu PHP packages only."
+    if report["context"].get("cpanel", {}).get("detected"):
+        return None, "cPanel/EasyApache manages PHP here; use the cPanel update path."
     ubuntu = report["context"].get("ubuntu_security") or {}
     release, branch = ubuntu.get("release"), ubuntu.get("branch")
     if (release, branch) not in UBUNTU_FIXED or not ubuntu.get("packages"):
