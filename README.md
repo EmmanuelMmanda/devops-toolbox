@@ -1,53 +1,88 @@
 # DevOps Toolbox
 
-Small, inspectable tools for server inventory and maintenance. Each tool has its own scope and instructions. **Nothing in this repository should be run with `curl | bash` or `irm | iex`; clone it and inspect the tool first.**
+Small, inspectable tools for server operators. Each tool states what it reads, what it changes, and where its conclusions stop.
 
-## PHP security scan
+## PHP security check
 
-`tools/php_security_scan.py` is a **read-only, offline** inventory for [CVE-2026-109618](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w) and [CVE-2026-109619](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp), announced on 21 October 2026. It supports Linux, cPanel servers, and Windows. It requires Python 3.8+ and only uses the Python standard library.
+`tools/php_security_scan.py` checks local evidence for [CVE-2026-109618](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w) and [CVE-2026-109619](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp). It is **read-only and offline**. It never installs updates, restarts services, writes a report, sends telemetry, or tests an exploit. Python 3.8+ and the standard library are enough.
 
-The scanner checks common PHP binaries, installed package revisions, local apt update candidates and package holds, running PHP and web processes, systemd services, local web/PHP listeners, selected Nginx/Apache handler settings, PHP-FPM pool settings, cPanel PHP configuration, IIS FastCGI paths, running Docker/Podman container names, and selected error counts in bounded log tails where available. It prints an assessment, the supporting evidence, check coverage, and specific next steps. It does **not** update software, restart services, modify files or settings, contact the network, or probe for an exploit. The default output is to the terminal; `--json` prints machine-readable JSON to standard output. The scanner itself never writes a report file.
+The default result is a short verdict, relevant evidence, and commands to consider. `--verbose` adds coverage and supporting findings. `--json` is for automation and sharing detailed evidence after review.
 
 ### Run
 
-Clone this repository to the server, inspect the script, and run from the repository root:
+Clone the repository, review the script, then run it from the repository root:
 
 ```bash
-# Linux or cPanel server
+git clone https://github.com/EmmanuelMmanda/devops-toolbox.git
+cd devops-toolbox
 python3 tools/php_security_scan.py
-python3 tools/php_security_scan.py --json
+python3 tools/php_security_scan.py --verbose
 ```
+
+On Windows PowerShell:
 
 ```powershell
-# Windows PowerShell
+git clone https://github.com/EmmanuelMmanda/devops-toolbox.git
+cd devops-toolbox
 py -3 .\tools\php_security_scan.py
-py -3 .\tools\php_security_scan.py --json
+py -3 .\tools\php_security_scan.py --verbose
 ```
 
-No administrator rights are required. Running as an administrator/root can reveal more package or process information, but it is optional. Some Windows servers use `python` rather than `py -3`.
+Run as root/Administrator if you need the fullest local process, socket, and configuration inventory. The tool does not require elevated privileges. Do not pipe a remote script directly into a shell.
 
-For a thorough Linux inventory, run as root and share the `--json` output after reviewing it. It includes package names and revisions, process paths, configured server names, routing settings, listener addresses, and container names. It intentionally omits whole configuration files, raw log lines, and container environment variables. No secrets are intentionally collected, but review any output before posting it publicly.
+### Example result
 
-### Reading the result
+```text
+PHP security check | read-only
+ACTION REQUIRED | CVE-2026-109618, CVE-2026-109619
 
-- `below_upstream_fix` means the observed binary's version precedes PHP's fixed upstream release. A vendor may have backported the fix; check its advisory for **both** CVEs.
-- `fixed_upstream` means the observed binary meets the upstream fixed version for its branch.
-- On Ubuntu 24.04, the scanner also checks installed PHP 8.3 packages against [USN-8948-1](https://ubuntu.com/security/notices/USN-8948-1): `8.3.6-0ubuntu0.24.04.13` is the first fixed Ubuntu package for both CVEs. `below_vendor_fix` means an installed package predates that revision; `fixed_vendor_backport` means it meets or exceeds it.
-- `unsupported_upstream_check_vendor` means PHP 8.1 or older. PHP has not published an upstream release for that branch; obtain a vendor-confirmed backport or upgrade.
-- `unreadable`, `unknown_branch`, and `insufficient_evidence` require manual follow-up.
+Web PHP: php8.3-fpm 8.3.6-0ubuntu0.24.04.12 (below first fixed 8.3.6-0ubuntu0.24.04.13).
+Active local Nginx -> PHP-FPM socket route observed; web ports: 80, 443.
+Apt cache: candidate 8.3.6-0ubuntu0.24.04.12.
 
-The first fixed upstream releases are **8.2.35, 8.3.36, 8.4.27, and 8.5.12**. Source: [PHP security notice](https://www.php.net/).
+Next actions
+  1. sudo apt update
+  2. apt-cache policy php8.3-fpm
+  If the candidate is 8.3.6-0ubuntu0.24.04.13 or newer:
+  3. sudo apt upgrade    # review proposed changes before accepting
+  4. sudo systemctl restart php8.3-fpm
+  5. python3 tools/php_security_scan.py
+  If still older: check apt sources/security pocket; do not assume an upgrade will fix it.
+  Then check service status and the served PHP runtime for each site.
 
-### Important limits
+Evidence: https://ubuntu.com/security/notices/USN-8948-1
+Scope: local inventory only; no web request or exploit test. Historical compromise is unknown.
+Details: --verbose | Automation: --json
+```
 
-CLI PHP can differ from the PHP serving a website. Check **each site's actual web PHP version**, including FPM pools, Apache modules, LiteSpeed, containers, and IIS handler mappings. The script shows local routing and process evidence but does not make network requests or execute commands inside containers. A fixed binary on disk does not prove an old worker has restarted. The scanner only has a built-in vendor backport check for Ubuntu 24.04 PHP 8.3; it cannot find every custom installation or determine whether a server was compromised. A clean scan is an inventory result, **not a security certification**. No local script can give 100% certainty about all possible running code paths or historical exploitation.
+This is illustrative output, not a claim about your server. Follow the commands only after checking the package candidate and reviewing apt's proposed changes. A PHP CLI version such as `8.3.6` can remain unchanged after Ubuntu backports a security fix; inspect the complete Ubuntu package revision.
 
-After confirming the vendor's patch, restart affected web workers, verify the served version per site, and investigate signs of compromise if the server was exposed before patching.
+### What it checks
 
-### Data handling
+- Common PHP binaries and upstream fixed versions: 8.2.35, 8.3.36, 8.4.27, and 8.5.12.
+- Installed Ubuntu 24.04 PHP 8.3 package revisions against [USN-8948-1](https://ubuntu.com/security/notices/USN-8948-1). This is the only built-in vendor backport rule. Other distributions and vendor builds require their own advisories.
+- Installed packages, local apt candidates and holds, running processes and services, common Nginx/Apache/FPM routing settings, and local listeners on Linux.
+- Common PHP binary paths and IIS FastCGI mappings on Windows; common EasyApache paths on cPanel.
+- Docker/Podman container listing and small samples of common error logs on Linux. It does not inspect inside containers or print log lines.
 
-The tool does not make network requests or send telemetry. Its terminal output can include local executable paths, package versions, and process names. Review it before sharing.
+When Nginx routes to an FPM socket that a pool configures and a PHP worker listens on, the tool calls this an **active local route**. That is stronger evidence than a CLI version alone, but it is not a live request to a site. Configured routes are reported separately when a listener or worker cannot be confirmed.
 
-## Future tools
+### Interpreting the result
 
-Keep future tools in `tools/`, with a clear statement of whether each one only inspects or also makes changes. This scanner is intentionally inspection only.
+`ACTION REQUIRED` means an installed Ubuntu 24.04 PHP 8.3 package is below Canonical's first fixed revision. `OBSERVED VERSIONS FIXED` means the observed binaries and recognized vendor packages meet known fixes; it does **not** verify the active web runtime. `REVIEW REQUIRED` means the available evidence cannot settle the vendor patch state. Treat unsupported or custom builds according to their vendor advisory.
+
+After updating, restart the affected PHP web workers, check the service, and verify the served PHP runtime for every site and handler. If the server was exposed before patching, investigate independently: zero counts in sampled logs do not prove that exploitation did not occur.
+
+### Boundaries and privacy
+
+The scanner never contacts a website, creates a diagnostic endpoint, changes local state, or provides a 100% security guarantee. It may miss custom installation paths, included configuration, Apache modules, LiteSpeed handlers, container internals, and workloads not visible to the current user. A patched file on disk does not prove an old worker has restarted.
+
+The default and verbose reports omit configured site names. `--json` can include local paths, socket names, process details, and container names; review it before sharing. No raw configuration files or log lines are returned. No secrets are intentionally collected.
+
+### Develop
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Contributions should preserve read-only behavior, distinguish observed facts from inferences, and include a test for each new vendor rule or routing conclusion. Security advisories and package thresholds must cite the vendor source. See [LICENSE](LICENSE) for the MIT license.

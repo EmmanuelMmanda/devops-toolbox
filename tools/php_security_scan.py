@@ -226,8 +226,8 @@ def config_inventory():
     }
     expressions = {
         "fpm_pools": re.compile(r"^\s*(?:\[[^]]+\]|listen\s*=|user\s*=|group\s*=|php_admin_value\[(?:memory_limit|session\.upload_progress\.enabled)\]\s*=)", re.I),
-        "nginx": re.compile(r"^\s*(?:fastcgi_pass|server_name|root)\s+", re.I),
-        "apache": re.compile(r"^\s*(?:ServerName|SetHandler|ProxyPassMatch|AddHandler|LoadModule\s+php|<FilesMatch)\b", re.I),
+        "nginx": re.compile(r"^\s*fastcgi_pass\s+", re.I),
+        "apache": re.compile(r"^\s*(?:SetHandler|ProxyPassMatch|AddHandler|LoadModule\s+php|<FilesMatch)\b", re.I),
     }
     output = {}
     for group, globs in patterns.items():
@@ -404,6 +404,37 @@ def windows_context():
     return result
 
 
+def web_route(context):
+    """Correlate local Nginx, FPM, and socket evidence without requesting a site."""
+    config = context.get("configuration", {})
+    nginx = [m["setting"] for m in config.get("nginx", {}).get("matches", [])]
+    pools = [m["setting"] for m in config.get("fpm_pools", {}).get("matches", [])]
+    routes = set()
+    for setting in nginx:
+        match = re.search(r"\bfastcgi_pass\s+unix:([^;\s]+)", setting, re.I)
+        if match:
+            routes.add(match.group(1))
+    pool_sockets = set()
+    for setting in pools:
+        match = re.match(r"listen\s*=\s*([^;\s]+)", setting, re.I)
+        if match and match.group(1).startswith("/"):
+            pool_sockets.add(match.group(1))
+    live_sockets = {item["socket"] for item in context.get("listeners", {}).get("php_unix", [])}
+    services = {item["unit"]: item["active"] for item in context.get("services", {}).get("units", [])}
+    processes = {item["name"] for item in context.get("process_inventory", {}).get("entries", [])}
+    matched = sorted(routes & pool_sockets)
+    active = bool("nginx" in processes and any("php-fpm" in p for p in processes))
+    live = sorted(set(matched) & live_sockets)
+    status = "active_local_route" if live and active else "configured_route" if matched else "unconfirmed"
+    ports = sorted({re.search(r":(80|443|8080|8443)$", item["local_address"]).group(1)
+                    for item in context.get("listeners", {}).get("tcp_web", [])
+                    if re.search(r":(80|443|8080|8443)$", item["local_address"])})
+    return {"status": status, "matched_sockets": matched, "listening_sockets": live,
+            "web_ports": ports, "nginx_active": services.get("nginx.service") == "active" or "nginx" in processes,
+            "fpm_active": any(name.startswith("php") and "fpm" in name and state == "active"
+                              for name, state in services.items()) or any("php-fpm" in p for p in processes)}
+
+
 def make_report():
     system = platform.system()
     context = windows_context() if system == "Windows" else linux_context() if system == "Linux" else {}
@@ -510,7 +541,8 @@ def make_report():
             "platform": system, "cves": list(CVES), "fixed_upstream": {
                 branch: ".".join(map(str, version)) for branch, version in FIXED.items()},
             "assessment": assessment, "binaries": binaries, "context": context,
-            "web_evidence": web_evidence, "coverage": coverage,
+            "web_evidence": web_evidence, "web_route": web_route(context) if system == "Linux" else None,
+            "coverage": coverage,
             "next_steps": next_steps, "verification_gaps": verification_gaps,
             "limitations": [
                 "Read-only local inventory; no network access, file writes, remediation, or exploit test.",
@@ -521,51 +553,103 @@ def make_report():
             ]}
 
 
+def render_report(report, verbose=False):
+    """Human-readable result; omit hostnames and raw inventory by default."""
+    context = report["context"]
+    ubuntu = context.get("ubuntu_security") or {}
+    route = report.get("web_route") or {}
+    affected = report["assessment"] == "ubuntu_packages_below_published_fix"
+    fixed = report["assessment"] == "observed_binaries_fixed_or_vendor_patched_web_mapping_unverified"
+    heading = "ACTION REQUIRED" if affected else "OBSERVED VERSIONS FIXED" if fixed else "REVIEW REQUIRED"
+    lines = ["PHP security check | read-only", "{} | {}".format(heading, ", ".join(CVES)), ""]
+    if ubuntu.get("packages"):
+        packages = ubuntu["packages"]
+        web_packages = [(name, item) for name, item in packages.items()
+                        if name.endswith("-fpm") or name.startswith("libapache2-mod-php")]
+        selected = web_packages or [(name, item) for name, item in packages.items() if name.endswith("-cli")]
+        if selected:
+            name, item = selected[0]
+            label = "Web PHP" if web_packages and route.get("status") == "active_local_route" else "PHP package"
+            lines.append("{}: {} {} ({}).".format(label, name, item["installed"],
+                         "below first fixed {}".format(ubuntu["first_fixed_package"])
+                         if item["status"] == "below_fix" else
+                         "meets first fixed {}".format(ubuntu["first_fixed_package"])
+                         if item["status"] == "fixed" else "fix status unknown"))
+        if len({p["status"] for p in packages.values()}) > 1:
+            lines.append("Installed PHP 8.3 packages have mixed fix status; inspect --verbose.")
+    elif report["binaries"]:
+        for item in report["binaries"][:3]:
+            lines.append("PHP {}: {}.".format(item.get("version") or "unknown", item["status"].replace("_", " ")))
+        if len(report["binaries"]) > 3:
+            lines.append("{} more binaries; inspect --verbose.".format(len(report["binaries"]) - 3))
+    else:
+        lines.append("No PHP binary found in common locations.")
+    if route.get("status") == "active_local_route":
+        lines.append("Active local Nginx -> PHP-FPM socket route observed; web ports: {}.".format(
+            ", ".join(route["web_ports"]) if route["web_ports"] else "not observed"))
+    elif route.get("status") == "configured_route":
+        lines.append("Nginx and FPM socket configuration match; active route not confirmed.")
+    elif report["web_evidence"].get("running_php_web_workers"):
+        lines.append("PHP web workers observed; exact request route not confirmed.")
+    if ubuntu:
+        candidate = context.get("apt_candidates", {}).get("php8.3-fpm") or context.get("apt_candidates", {}).get("php8.3-cli")
+        lines.append("Apt cache: {}.".format("candidate " + candidate if candidate else "candidate unavailable"))
+        holds = context.get("apt_holds", {}).get("php_packages", [])
+        if holds:
+            lines.append("Apt holds: {}.".format(", ".join(holds)))
+    lines.extend(["", "Next actions"])
+    if affected and ubuntu:
+        lines.extend(["  1. sudo apt update", "  2. apt-cache policy php8.3-fpm"])
+        lines.append("  If the candidate is {} or newer:".format(ubuntu["first_fixed_package"]))
+        lines.extend(["  3. sudo apt upgrade    # review proposed changes before accepting",
+                      "  4. sudo systemctl restart php8.3-fpm",
+                      "  5. python3 tools/php_security_scan.py"])
+        lines.append("  If still older: check apt sources/security pocket; do not assume an upgrade will fix it.")
+        lines.append("  Then check service status and the served PHP runtime for each site.")
+    elif fixed:
+        lines.append("  Confirm affected web workers restarted after the package update.")
+        lines.append("  Verify the served PHP runtime for each site, including containers and other handlers.")
+    else:
+        lines.append("  Check the PHP/vendor advisories for both CVEs and update each affected web runtime.")
+        lines.append("  Trace each web handler to its PHP runtime; verify the patch and restart affected workers.")
+    lines.extend(["", "Evidence: " + (ubuntu.get("notice") or "https://www.php.net/"),
+                  "Scope: local inventory only; no web request or exploit test. Historical compromise is unknown.",
+                  "Details: --verbose | Automation: --json"])
+    if verbose:
+        lines.extend(["", "Evidence and coverage", "Binaries:"])
+        for item in report["binaries"]:
+            lines.append("  {} | {} | {}".format(item.get("version") or "?", item["status"], item["path"]))
+        if not report["binaries"]:
+            lines.append("  none found")
+        if ubuntu:
+            lines.append("Ubuntu packages:")
+            for name, item in sorted(ubuntu["packages"].items()):
+                lines.append("  {} {} {}".format(name, item["installed"], item["status"]))
+            lines.append("Apt candidates (local cache):")
+            for name, version in sorted(context.get("apt_candidates", {}).items()):
+                lines.append("  {} {}".format(name, version))
+        if route:
+            lines.append("Matched FPM sockets: {}".format(len(route.get("matched_sockets", []))))
+            lines.append("Listening matched sockets: {}".format(len(route.get("listening_sockets", []))))
+        lines.append("Web workers: {}".format(", ".join(report["web_evidence"].get("running_php_web_workers", [])) or "none observed"))
+        lines.append("Coverage:")
+        for item in report["coverage"]:
+            lines.append("  {}: {}".format(item["check"], item["status"]))
+        lines.append("Remaining gaps:")
+        for gap in report["verification_gaps"]:
+            lines.append("  - " + gap)
+        lines.append("Raw structured evidence is available with --json; review local paths before sharing.")
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--json", action="store_true", help="Print structured JSON to stdout")
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument("--verbose", action="store_true", help="Show supporting evidence and coverage")
+    output.add_argument("--json", action="store_true", help="Print structured JSON for automation")
     args = parser.parse_args()
     report = make_report()
-    if args.json:
-        print(json.dumps(report, indent=2))
-    else:
-        print("PHP security inventory (read-only)")
-        print("CVEs: " + ", ".join(report["cves"]))
-        print("Assessment: " + report["assessment"].replace("_", " "))
-        print("Platform: " + report["platform"])
-        print("\nObserved PHP binaries:")
-        for item in report["binaries"]:
-            package = " [{}]".format(item.get("vendor_package_version")) if item.get("vendor_package_version") else ""
-            print("  {}  {}{}  {}".format(item["version"] or "?", item["status"], package, item["path"]))
-        if not report["binaries"]:
-            print("  None found in common locations")
-        print("\nWeb runtime evidence:")
-        print(json.dumps(report["web_evidence"], indent=2))
-        ubuntu = report["context"].get("ubuntu_security")
-        if ubuntu:
-            print("\nUbuntu vendor package check: " + ubuntu["notice"])
-            print("  First fixed package: " + ubuntu["first_fixed_package"])
-            for name, item in ubuntu["packages"].items():
-                print("  {}  {}  {}".format(item["status"], item["installed"], name))
-        if report["context"].get("apt_candidates"):
-            print("\nLocal apt candidates (cache only):")
-            for name, candidate in report["context"]["apt_candidates"].items():
-                print("  {}  {}".format(name, candidate))
-        for key in ("apt_holds", "services", "process_inventory", "listeners", "configuration", "containers", "log_signals"):
-            if key in report["context"]:
-                print("\n{}:".format(key.replace("_", " ").title()))
-                print(json.dumps(report["context"][key], indent=2))
-        print("\nCoverage:")
-        for item in report["coverage"]:
-            print("  {}: {}{}".format(item["check"], item["status"],
-                  " — " + item["note"] if item.get("note") else ""))
-        print("\nNext steps:")
-        for step in report["next_steps"]:
-            print("  - " + step)
-        print("\nVerification gaps:")
-        for gap in report["verification_gaps"]:
-            print("  - " + gap)
-        print("\nLimits: " + " ".join(report["limitations"]))
+    print(json.dumps(report, indent=2) if args.json else render_report(report, args.verbose))
     return 0
 
 

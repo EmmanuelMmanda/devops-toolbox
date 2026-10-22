@@ -78,7 +78,37 @@ class SecurityScanTests(unittest.TestCase):
                 result = scan.config_inventory()
         self.assertEqual(result["nginx"]["files_checked"], 1)
         self.assertNotIn("secret-value", json.dumps(result))
-        self.assertEqual(len(result["nginx"]["matches"]), 2)
+        self.assertEqual(len(result["nginx"]["matches"]), 1)
+        self.assertNotIn("example.test", json.dumps(result))
+
+    def test_active_route_and_short_action_plan(self):
+        context = ubuntu_context("below_fix")
+        context["ubuntu_security"]["packages"]["php8.3-fpm"] = {
+            "installed": "8.3.6-0ubuntu0.24.04.12", "status": "below_fix"}
+        context["apt_candidates"]["php8.3-fpm"] = "8.3.6-0ubuntu0.24.04.12"
+        context["configuration"]["nginx"]["matches"] = [{
+            "setting": "fastcgi_pass unix:/run/php/php8.3-fpm.sock;"}]
+        context["configuration"]["fpm_pools"]["matches"] = [{
+            "setting": "listen = /run/php/php8.3-fpm.sock"}]
+        context["listeners"] = {"status": "checked", "tcp_web": [
+            {"local_address": "0.0.0.0:80"}, {"local_address": "0.0.0.0:443"}],
+            "php_unix": [{"socket": "/run/php/php8.3-fpm.sock"}]}
+        context["process_inventory"]["entries"] = [
+            {"name": "nginx", "php_module_loaded": False, "deleted_php_mapping": False},
+            {"name": "php-fpm8.3", "php_module_loaded": False, "deleted_php_mapping": False}]
+        binary = {"path": "/usr/bin/php8.3", "version": "8.3.6", "status": "below_vendor_fix"}
+        with patch.object(scan.platform, "system", return_value="Linux"), \
+             patch.object(scan, "linux_context", return_value=context), \
+             patch.object(scan, "candidates", return_value=["/usr/bin/php8.3"]), \
+             patch.object(scan, "inspect_binary", return_value=binary):
+            report = scan.make_report()
+        rendered = scan.render_report(report)
+        self.assertEqual(report["web_route"]["status"], "active_local_route")
+        self.assertIn("ACTION REQUIRED", rendered)
+        self.assertIn("sudo apt update", rendered)
+        self.assertIn("8.3.6-0ubuntu0.24.04.13", rendered)
+        self.assertNotIn("{", rendered)
+        self.assertNotIn("example.test", rendered)
 
 
 if __name__ == "__main__":
