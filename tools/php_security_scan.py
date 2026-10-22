@@ -24,6 +24,9 @@ VERSION_RE = re.compile(r"PHP\s+(\d+)\.(\d+)\.(\d+)", re.I)
 MAX_BINARIES = 100
 UBUNTU_FIXED = {("24.04", "8.3"): "8.3.6-0ubuntu0.24.04.13"}
 UBUNTU_NOTICE = "https://ubuntu.com/security/notices/USN-8948-1"
+MAX_CONFIG_MATCHES = 120
+WEB_PROCESS_RE = re.compile(r"php|apache|httpd|nginx|litespeed|lsws|caddy|frankenphp", re.I)
+PHP_PACKAGE_RE = re.compile(r"(?:php|libapache2-mod-php|ea-php|alt-php)[\w.+-]*$")
 
 
 def run(argv, timeout=6):
@@ -34,6 +37,18 @@ def run(argv, timeout=6):
         return p.stdout[:200000] if p.returncode == 0 else ""
     except (OSError, subprocess.TimeoutExpired):
         return ""
+
+
+def probe(argv, timeout=8):
+    """Return a bounded result for an inspection command; never invoke a shell."""
+    try:
+        p = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=timeout, check=False)
+        return {"ok": p.returncode == 0, "stdout": p.stdout[:200000],
+                "error": (p.stderr[:300].strip() or "exit_code_{}".format(p.returncode))
+                if p.returncode else ""}
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "stdout": "", "error": type(exc).__name__}
 
 
 def version_status(version):
@@ -113,10 +128,208 @@ def dpkg_ge(installed, fixed):
     return None
 
 
+def apt_candidates(package_names):
+    result = {}
+    if not shutil.which("apt-cache"):
+        return result
+    for name in package_names:
+        output = run(["apt-cache", "policy", name])
+        match = re.search(r"^\s*Candidate:\s*(\S+)", output, re.M)
+        if match:
+            result[name] = match.group(1)
+    return result
+
+
+def apt_holds():
+    if not shutil.which("apt-mark"):
+        return {"status": "unavailable", "php_packages": []}
+    check = probe(["apt-mark", "showhold"])
+    return {"status": "checked" if check["ok"] else "unavailable",
+            "php_packages": [x for x in check["stdout"].splitlines()
+                             if PHP_PACKAGE_RE.fullmatch(x.strip())][:100],
+            "reason": check["error"]}
+
+
+def process_inventory():
+    """Read process names, executable links and PHP module state from procfs."""
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return {"status": "unavailable", "entries": []}
+    grouped = {}
+    try:
+        pids = [p for p in proc.iterdir() if p.name.isdigit()]
+    except OSError:
+        return {"status": "unavailable", "entries": []}
+    unreadable = 0
+    for pid_dir in pids:
+        try:
+            name = (pid_dir / "comm").read_text(errors="replace").strip()
+            if not WEB_PROCESS_RE.search(name):
+                continue
+            try:
+                executable = os.readlink(str(pid_dir / "exe"))
+            except OSError:
+                executable = None
+                unreadable += 1
+            module = False
+            old_php_mapping = False
+            if re.search(r"apache|httpd|php|litespeed|lsws|frankenphp", name, re.I):
+                try:
+                    with (pid_dir / "maps").open(errors="replace") as maps:
+                        for line in maps:
+                            lower = line.lower()
+                            if "libphp" in lower:
+                                module = True
+                            if "(deleted)" in lower and "php" in lower:
+                                old_php_mapping = True
+                except OSError:
+                    unreadable += 1
+            key = (name, executable, module, old_php_mapping)
+            entry = grouped.setdefault(key, {"name": name, "executable": executable,
+                                             "php_module_loaded": module,
+                                             "deleted_php_mapping": old_php_mapping,
+                                             "count": 0, "example_pids": []})
+            entry["count"] += 1
+            if len(entry["example_pids"]) < 5:
+                entry["example_pids"].append(int(pid_dir.name))
+        except OSError:
+            unreadable += 1
+    return {"status": "checked", "entries": sorted(grouped.values(),
+            key=lambda x: (-x["count"], x["name"]))[:80],
+            "unreadable_process_items": unreadable}
+
+
+def service_inventory():
+    if not shutil.which("systemctl"):
+        return {"status": "unavailable", "units": []}
+    result = probe(["systemctl", "list-units", "--all", "--type=service",
+                    "--no-legend", "--plain"], timeout=12)
+    if not result["ok"]:
+        return {"status": "unavailable", "reason": result["error"], "units": []}
+    units = []
+    for line in result["stdout"].splitlines():
+        parts = line.lstrip("● ").split()
+        if len(parts) >= 4 and WEB_PROCESS_RE.search(parts[0]):
+            units.append({"unit": parts[0], "load": parts[1],
+                          "active": parts[2], "sub": parts[3]})
+    return {"status": "checked", "units": units[:80]}
+
+
+def config_inventory():
+    patterns = {
+        "fpm_pools": ["/etc/php/*/fpm/pool.d/*.conf", "/usr/local/etc/php-fpm.d/*.conf",
+                      "/opt/cpanel/ea-php*/root/etc/php-fpm.d/*.conf"],
+        "nginx": ["/etc/nginx/nginx.conf", "/etc/nginx/sites-enabled/*",
+                  "/etc/nginx/conf.d/*.conf"],
+        "apache": ["/etc/apache2/sites-enabled/*", "/etc/apache2/mods-enabled/*",
+                   "/etc/httpd/conf/httpd.conf", "/etc/httpd/conf.d/*.conf"],
+    }
+    expressions = {
+        "fpm_pools": re.compile(r"^\s*(?:\[[^]]+\]|listen\s*=|user\s*=|group\s*=|php_admin_value\[(?:memory_limit|session\.upload_progress\.enabled)\]\s*=)", re.I),
+        "nginx": re.compile(r"^\s*(?:fastcgi_pass|server_name|root)\s+", re.I),
+        "apache": re.compile(r"^\s*(?:ServerName|SetHandler|ProxyPassMatch|AddHandler|LoadModule\s+php|<FilesMatch)\b", re.I),
+    }
+    output = {}
+    for group, globs in patterns.items():
+        paths = sorted({p for pattern in globs for p in glob.glob(pattern)})[:120]
+        matches = []
+        unreadable = 0
+        for path in paths:
+            try:
+                with open(path, encoding="utf-8", errors="replace") as handle:
+                    for number, line in enumerate(handle, 1):
+                        if number > 5000 or len(matches) >= MAX_CONFIG_MATCHES:
+                            break
+                        value = line.strip()
+                        if not value or value.startswith(("#", ";")):
+                            continue
+                        if expressions[group].search(value):
+                            # Report only selected routing settings, not full configuration.
+                            matches.append({"file": path, "line": number, "setting": value[:250]})
+            except OSError:
+                unreadable += 1
+            if len(matches) >= MAX_CONFIG_MATCHES:
+                break
+        output[group] = {"files_checked": len(paths), "matches": matches,
+                         "unreadable_files": unreadable,
+                         "truncated": len(paths) >= 120 or len(matches) >= MAX_CONFIG_MATCHES}
+    return output
+
+
+def container_inventory():
+    result = {}
+    for engine in ("docker", "podman"):
+        if not shutil.which(engine):
+            result[engine] = {"status": "unavailable", "containers": []}
+            continue
+        check = probe([engine, "ps", "--format", "{{.ID}}\t{{.Image}}\t{{.Names}}"], timeout=10)
+        if check["ok"]:
+            items = []
+            for line in check["stdout"].splitlines()[:100]:
+                parts = line.split("\t", 2)
+                if len(parts) == 3:
+                    items.append({"id": parts[0], "image": parts[1], "name": parts[2]})
+            result[engine] = {"status": "checked", "containers": items}
+        else:
+            result[engine] = {"status": "unavailable", "reason": check["error"],
+                              "containers": []}
+    return result
+
+
+def listener_inventory():
+    if not shutil.which("ss"):
+        return {"status": "unavailable", "tcp_web": [], "php_unix": []}
+    tcp = probe(["ss", "-H", "-ltnp"])
+    unix = probe(["ss", "-H", "-lxnp"])
+    web = []
+    if tcp["ok"]:
+        for line in tcp["stdout"].splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and re.search(r":(?:80|443|8080|8443)$", parts[3]):
+                web.append({"local_address": parts[3], "process": parts[-1][:180]})
+    sockets = []
+    if unix["ok"]:
+        for line in unix["stdout"].splitlines():
+            if re.search(r"php|fpm|lsphp", line, re.I):
+                parts = line.split()
+                sockets.append({"socket": next((p for p in parts if p.startswith("/") and
+                                                 re.search(r"php|fpm|lsphp", p, re.I)), "unknown"),
+                                "process": parts[-1][:180] if parts else ""})
+    return {"status": "checked" if tcp["ok"] or unix["ok"] else "unavailable",
+            "tcp_web": web[:40], "php_unix": sockets[:40],
+            "reason": "" if tcp["ok"] or unix["ok"] else tcp["error"]}
+
+
+def log_signal_inventory():
+    """Count selected PHP crash/error phrases in bounded log tails; never print lines."""
+    patterns = ["/var/log/php*-fpm.log", "/var/log/nginx/error.log",
+                "/var/log/apache2/error.log", "/var/log/httpd/error_log"]
+    paths = sorted({p for pattern in patterns for p in glob.glob(pattern)})[:30]
+    checks = [("php_fatal", re.compile(rb"PHP Fatal error", re.I)),
+              ("php_memory_exhaustion", re.compile(rb"Allowed memory size.*exhausted|out of memory", re.I)),
+              ("php_worker_crash", re.compile(rb"php.*(?:segfault|SIGSEGV|child exited on signal)", re.I))]
+    files = []
+    for path in paths:
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - 2_000_000))
+                data = handle.read(2_000_000)
+            files.append({"path": path, "bytes_sampled": len(data),
+                          "tail_only": size > len(data),
+                          "signals": {label: len(pattern.findall(data)) for label, pattern in checks}})
+        except OSError:
+            files.append({"path": path, "status": "unreadable"})
+    return {"status": "checked" if paths else "no_common_logs_found", "files": files}
+
+
 def linux_context():
     result = {"distribution": None, "php_packages": [], "php_processes": [],
               "cpanel": {"detected": False, "configured_branches": []},
-              "ubuntu_security": None}
+              "ubuntu_security": None, "apt_candidates": {},
+              "services": {}, "process_inventory": {}, "configuration": {},
+              "containers": {}, "listeners": {}, "apt_holds": {}, "log_signals": {}}
     os_id = version_id = None
     try:
         data = Path("/etc/os-release").read_text(errors="replace")
@@ -130,9 +343,12 @@ def linux_context():
     except OSError:
         pass
     if shutil.which("dpkg-query"):
-        output = run(["dpkg-query", "-W", "-f=${Package}\t${Version}\n"], timeout=12)
-        result["php_packages"] = [line for line in output.splitlines()
-                                  if re.match(r"(?:php|libapache2-mod-php|ea-php|alt-php)[\w.+-]*\t", line)][:200]
+        output = run(["dpkg-query", "-W", "-f=${db:Status-Abbrev}\t${Package}\t${Version}\n"], timeout=12)
+        for line in output.splitlines():
+            parts = line.split("\t", 2)
+            if len(parts) == 3 and parts[0].strip() == "ii" and PHP_PACKAGE_RE.fullmatch(parts[1]):
+                result["php_packages"].append(parts[1] + "\t" + parts[2])
+        result["php_packages"] = result["php_packages"][:200]
     elif shutil.which("rpm"):
         output = run(["rpm", "-qa", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\n"], timeout=12)
         result["php_packages"] = [line for line in output.splitlines()
@@ -149,10 +365,18 @@ def linux_context():
                                   "status": "unknown" if ge is None else "fixed" if ge else "below_fix"}
         result["ubuntu_security"] = {"release": "24.04", "notice": UBUNTU_NOTICE,
                                      "first_fixed_package": fixed, "packages": packages}
-    for name in ("php-fpm", "php-cgi", "lsphp", "httpd", "apache2", "frankenphp", "litespeed"):
-        output = run(["pgrep", "-x", name]) if shutil.which("pgrep") else ""
-        if output.strip():
-            result["php_processes"].append(name)
+    result["apt_candidates"] = apt_candidates(["php8.3-cli", "php8.3-fpm", "php8.3-common",
+                                                 "libapache2-mod-php8.3"])
+    result["apt_holds"] = apt_holds()
+    result["services"] = service_inventory()
+    result["process_inventory"] = process_inventory()
+    result["php_processes"] = sorted({entry["name"] for entry in
+                                      result["process_inventory"].get("entries", [])
+                                      if re.search(r"php|lsphp", entry["name"], re.I)})
+    result["configuration"] = config_inventory()
+    result["containers"] = container_inventory()
+    result["listeners"] = listener_inventory()
+    result["log_signals"] = log_signal_inventory()
     cpanel_file = Path("/etc/cpanel/ea4/php.conf")
     result["cpanel"]["detected"] = cpanel_file.exists() or Path("/usr/local/cpanel").exists()
     if cpanel_file.exists():
@@ -195,30 +419,104 @@ def make_report():
         assessment = "observed_binaries_fixed_or_vendor_patched_web_mapping_unverified"
     else:
         assessment = "insufficient_evidence"
+    processes = context.get("process_inventory", {}).get("entries", [])
+    config = context.get("configuration", {})
+    running_containers = sum(len(v.get("containers", [])) for v in
+                             context.get("containers", {}).values())
+    web_evidence = {
+        "running_web_processes": sorted({p["name"] for p in processes
+            if re.search(r"apache|httpd|nginx|litespeed|lsws|caddy|frankenphp", p["name"], re.I)}),
+        "running_php_processes": (sorted({p["name"] for p in processes
+            if re.search(r"php|lsphp", p["name"], re.I)}) if system == "Linux"
+            else context.get("php_processes", [])),
+        "running_php_web_workers": sorted({p["name"] for p in processes
+            if re.search(r"php-fpm|php-cgi|lsphp|frankenphp", p["name"], re.I)}),
+        "apache_php_module_observed": any(p["php_module_loaded"] for p in processes),
+        "old_php_mappings_observed": any(p["deleted_php_mapping"] for p in processes),
+        "fpm_pool_files_found": config.get("fpm_pools", {}).get("files_checked", 0),
+        "web_handler_matches": (sum(1 for group in ("nginx", "apache") for m in
+                                   config.get(group, {}).get("matches", [])
+                                   if re.search(r"fastcgi_pass|SetHandler|ProxyPassMatch|AddHandler|LoadModule", m["setting"], re.I))
+                                   if system == "Linux" else len(context.get("iis_fastcgi_paths", []))),
+        "running_containers": running_containers,
+        "web_tcp_listeners": len(context.get("listeners", {}).get("tcp_web", [])),
+        "php_unix_listeners": len(context.get("listeners", {}).get("php_unix", [])),
+    }
+    coverage = []
+    if system == "Linux":
+        coverage = [
+            {"check": "installed_packages", "status": "checked" if shutil.which("dpkg-query") or shutil.which("rpm") else "unavailable"},
+            {"check": "apt_candidates", "status": "checked" if shutil.which("apt-cache") else "unavailable",
+             "note": "Uses local apt metadata; does not refresh repositories."},
+            {"check": "apt_package_holds", "status": context["apt_holds"].get("status", "unavailable")},
+            {"check": "running_processes", "status": context["process_inventory"].get("status", "unavailable")},
+            {"check": "systemd_services", "status": context["services"].get("status", "unavailable")},
+            {"check": "common_web_and_fpm_config", "status": "partial" if any(
+                v["unreadable_files"] or v["truncated"] for v in config.values()) else "checked",
+             "note": "Only common config locations and selected routing directives are inspected."},
+            {"check": "container_listing", "status": "checked" if any(
+                v["status"] == "checked" for v in context["containers"].values()) else "unavailable",
+             "note": "Container internals are not inspected."},
+            {"check": "local_listeners", "status": context["listeners"].get("status", "unavailable")},
+            {"check": "common_error_log_tails", "status": context["log_signals"].get("status", "unavailable"),
+             "note": "Counts selected error phrases in up to 2 MB per log; no log lines are printed."},
+            {"check": "live_web_request", "status": "not_performed",
+             "note": "The scanner creates no web endpoint and sends no network request."},
+        ]
+    elif system == "Windows":
+        coverage = [
+            {"check": "common_php_binaries", "status": "checked"},
+            {"check": "iis_fastcgi_paths", "status": "checked" if Path(
+                os.environ.get("WINDIR", r"C:\Windows"), "System32", "inetsrv", "appcmd.exe").is_file()
+                else "unavailable"},
+            {"check": "running_php_processes", "status": "checked" if shutil.which("powershell.exe") or shutil.which("pwsh.exe") else "unavailable"},
+            {"check": "vendor_package_provenance", "status": "not_performed"},
+            {"check": "live_web_request", "status": "not_performed"},
+        ]
     next_steps = []
     if assessment == "ubuntu_packages_below_published_fix":
         next_steps.append("Ubuntu USN-8948-1 fixes both CVEs in PHP 8.3 package 8.3.6-0ubuntu0.24.04.13. Update installed PHP packages to at least this revision.")
+        held = context.get("apt_holds", {}).get("php_packages", [])
+        if held:
+            next_steps.append("PHP packages are held by apt: {}. Review these holds before updating.".format(", ".join(held)))
+        candidate = context.get("apt_candidates", {}).get("php8.3-fpm") or context.get("apt_candidates", {}).get("php8.3-cli")
+        if candidate:
+            ge = dpkg_ge(candidate, UBUNTU_FIXED[("24.04", "8.3")])
+            if ge is False:
+                next_steps.append("Local apt metadata does not yet offer the fixed package. Refresh apt metadata and check enabled Ubuntu security repositories.")
+            elif ge is True:
+                next_steps.append("Local apt metadata offers a fixed PHP package; install updates during a maintenance window.")
     if assessment == "potentially_affected_check_vendor_backports":
         next_steps.append("Check the vendor advisory for both CVEs. Update every web-serving PHP branch lacking a confirmed fix.")
     if not binaries:
-        next_steps.append("No PHP binary found in common locations. Inspect web-server mappings, containers, and custom installs.")
-    if system == "Windows":
-        next_steps.append("Confirm IIS Handler Mappings and FastCGI Settings for every site; compare those paths with the binaries above.")
-    elif system == "Linux":
-        next_steps.append("Confirm each site's actual web PHP version; CLI, FPM, Apache module, LiteSpeed, and containers can differ.")
-    next_steps.extend([
-        "For packages without a matched official vendor notice, an upstream version comparison cannot confirm whether a backport is present.",
-        "After a confirmed patch, restart every affected web worker and verify the version through each served site.",
-        "If previously exposed, review logs and investigate signs of compromise; this scan cannot establish whether exploitation occurred."
-    ])
+        next_steps.append("No local PHP binary was found in common paths; this inventory cannot classify an installed runtime.")
+    if web_evidence["old_php_mappings_observed"]:
+        next_steps.append("A running worker maps a deleted PHP file. Restart that worker after updating its package.")
+    log_files = context.get("log_signals", {}).get("files", [])
+    if any(sum(item.get("signals", {}).values()) > 0 for item in log_files):
+        next_steps.append("The sampled error logs contain PHP crash or fatal-error signals. Investigate the counted logs; these signals alone do not establish exploitation.")
+    verification_gaps = ["The actual PHP version served by each website was not measured: this scan sends no HTTP request and creates no web endpoint.",
+                         "Historical exploitation cannot be ruled out by inventory or bounded log samples."]
+    if system == "Linux":
+        if not web_evidence["running_php_web_workers"] and not web_evidence["apache_php_module_observed"]:
+            verification_gaps.append("No active PHP web worker was observed. PHP could be CLI-only, stopped, in a container, or outside inspected paths.")
+        if running_containers:
+            verification_gaps.append("Container names were listed, but installed PHP inside containers was not inspected.")
+        if not web_evidence["web_handler_matches"]:
+            verification_gaps.append("No PHP web handler was found in the common Nginx/Apache config locations.")
+    elif system == "Windows" and not context.get("iis_fastcgi_paths"):
+        verification_gaps.append("No IIS FastCGI PHP path was observed; custom or bundled PHP installations may exist.")
     return {"tool": "php-security-scan", "scan_time_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "platform": system, "cves": list(CVES), "fixed_upstream": {
                 branch: ".".join(map(str, version)) for branch, version in FIXED.items()},
             "assessment": assessment, "binaries": binaries, "context": context,
-            "next_steps": next_steps, "limitations": [
+            "web_evidence": web_evidence, "coverage": coverage,
+            "next_steps": next_steps, "verification_gaps": verification_gaps,
+            "limitations": [
                 "Read-only local inventory; no network access, file writes, remediation, or exploit test.",
                 "Only Ubuntu 24.04 PHP 8.3 has a built-in vendor package advisory check; other vendor backports require manual verification.",
-                "Cannot discover every custom installation, container, or domain mapping.",
+                "Cannot discover every custom installation, container runtime, include path, or domain mapping.",
+                "Cannot prove absence of compromise or reach 100% certainty from local inventory alone.",
                 "A clean result is not proof that every web request uses patched PHP."
             ]}
 
@@ -237,14 +535,36 @@ def main():
         print("Platform: " + report["platform"])
         print("\nObserved PHP binaries:")
         for item in report["binaries"]:
-            print("  {}  {}  {}".format(item["version"] or "?", item["status"], item["path"]))
+            package = " [{}]".format(item.get("vendor_package_version")) if item.get("vendor_package_version") else ""
+            print("  {}  {}{}  {}".format(item["version"] or "?", item["status"], package, item["path"]))
         if not report["binaries"]:
             print("  None found in common locations")
-        print("\nLocal context:")
-        print(json.dumps(report["context"], indent=2))
+        print("\nWeb runtime evidence:")
+        print(json.dumps(report["web_evidence"], indent=2))
+        ubuntu = report["context"].get("ubuntu_security")
+        if ubuntu:
+            print("\nUbuntu vendor package check: " + ubuntu["notice"])
+            print("  First fixed package: " + ubuntu["first_fixed_package"])
+            for name, item in ubuntu["packages"].items():
+                print("  {}  {}  {}".format(item["status"], item["installed"], name))
+        if report["context"].get("apt_candidates"):
+            print("\nLocal apt candidates (cache only):")
+            for name, candidate in report["context"]["apt_candidates"].items():
+                print("  {}  {}".format(name, candidate))
+        for key in ("apt_holds", "services", "process_inventory", "listeners", "configuration", "containers", "log_signals"):
+            if key in report["context"]:
+                print("\n{}:".format(key.replace("_", " ").title()))
+                print(json.dumps(report["context"][key], indent=2))
+        print("\nCoverage:")
+        for item in report["coverage"]:
+            print("  {}: {}{}".format(item["check"], item["status"],
+                  " — " + item["note"] if item.get("note") else ""))
         print("\nNext steps:")
         for step in report["next_steps"]:
             print("  - " + step)
+        print("\nVerification gaps:")
+        for gap in report["verification_gaps"]:
+            print("  - " + gap)
         print("\nLimits: " + " ".join(report["limitations"]))
     return 0
 

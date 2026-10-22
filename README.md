@@ -6,7 +6,7 @@ Small, inspectable tools for server inventory and maintenance. Each tool has its
 
 `tools/php_security_scan.py` is a **read-only, offline** inventory for [CVE-2026-109618](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w) and [CVE-2026-109619](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp), announced on 21 October 2026. It supports Linux, cPanel servers, and Windows. It requires Python 3.8+ and only uses the Python standard library.
 
-The scanner checks common PHP binaries, package metadata, running PHP/web process names, cPanel PHP configuration, and IIS FastCGI paths where available. It prints an assessment and next steps. It does **not** update software, restart services, modify files or settings, contact the network, or probe for an exploit. The default output is to the terminal; `--json` prints machine-readable JSON to standard output. The scanner itself never writes a report file.
+The scanner checks common PHP binaries, installed package revisions, local apt update candidates and package holds, running PHP and web processes, systemd services, local web/PHP listeners, selected Nginx/Apache handler settings, PHP-FPM pool settings, cPanel PHP configuration, IIS FastCGI paths, running Docker/Podman container names, and selected error counts in bounded log tails where available. It prints an assessment, the supporting evidence, check coverage, and specific next steps. It does **not** update software, restart services, modify files or settings, contact the network, or probe for an exploit. The default output is to the terminal; `--json` prints machine-readable JSON to standard output. The scanner itself never writes a report file.
 
 ### Run
 
@@ -26,6 +26,8 @@ py -3 .\tools\php_security_scan.py --json
 
 No administrator rights are required. Running as an administrator/root can reveal more package or process information, but it is optional. Some Windows servers use `python` rather than `py -3`.
 
+For a thorough Linux inventory, run as root and share the `--json` output after reviewing it. It includes package names and revisions, process paths, configured server names, routing settings, listener addresses, and container names. It intentionally omits whole configuration files, raw log lines, and container environment variables. No secrets are intentionally collected, but review any output before posting it publicly.
+
 ### Reading the result
 
 - `below_upstream_fix` means the observed binary's version precedes PHP's fixed upstream release. A vendor may have backported the fix; check its advisory for **both** CVEs.
@@ -38,7 +40,7 @@ The first fixed upstream releases are **8.2.35, 8.3.36, 8.4.27, and 8.5.12**. So
 
 ### Important limits
 
-CLI PHP can differ from the PHP serving a website. Check **each site's actual web PHP version**, including FPM pools, Apache modules, LiteSpeed, containers, and IIS handler mappings. A fixed binary on disk does not prove an old worker has restarted. The scanner only has a built-in vendor backport check for Ubuntu 24.04 PHP 8.3; it cannot find every custom installation or determine whether a server was compromised. A clean scan is an inventory result, **not a security certification**.
+CLI PHP can differ from the PHP serving a website. Check **each site's actual web PHP version**, including FPM pools, Apache modules, LiteSpeed, containers, and IIS handler mappings. The script shows local routing and process evidence but does not make network requests or execute commands inside containers. A fixed binary on disk does not prove an old worker has restarted. The scanner only has a built-in vendor backport check for Ubuntu 24.04 PHP 8.3; it cannot find every custom installation or determine whether a server was compromised. A clean scan is an inventory result, **not a security certification**. No local script can give 100% certainty about all possible running code paths or historical exploitation.
 
 After confirming the vendor's patch, restart affected web workers, verify the served version per site, and investigate signs of compromise if the server was exposed before patching.
 
